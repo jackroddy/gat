@@ -1,0 +1,28 @@
+[package]
+name = "rimg"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lexopt = "0.3"
+base64 = "0.23"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+rustix = { version = "1.1", features = ["termios", "stdio", "event"] }
+image = { version = "0.25", default-features = false }
+hayro = { version = "0.7", optional = true }
+resvg = { version = "0.48", optional = true, default-features = false }
+pdfium-render = { version = "0.9", optional = true, default-features = false, features = ["image_025", "thread_safe", "pdfium_latest"] }
+
+[features]
+default = ["png", "jpeg", "pdf"]
+png = ["image/png"]
+jpeg = ["image/jpeg"]
+svg = ["dep:resvg", "resvg/text"]
+pdf = ["dep:hayro"]
+pdf-pdfium = ["dep:pdfium-render"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
