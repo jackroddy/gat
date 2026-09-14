@@ -37,7 +37,7 @@ fn main() -> ExitCode {
     if terminal.protocol != Protocol::Kitty && !args.force {
         eprintln!(
             "rimg: this terminal does not support the kitty graphics protocol \
-             (--force-kitty overrides)"
+             (--probe says what detection saw, --force-kitty overrides)"
         );
         return ExitCode::from(1);
     }

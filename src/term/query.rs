@@ -16,11 +16,20 @@ use rustix::termios::{
 // has already queued, so a slow terminal needs this grace window too
 const DRAIN_GRACE: Duration = Duration::from_millis(60);
 
+/// The most [`Probe::set_grace`] will widen that window to.
+//
+// nothing arriving is the usual outcome, and drain() cannot tell that from a
+// reply still in flight, so it waits out the whole window every time. the
+// grace is a cost paid on every query, not just on the rare late one, which
+// is why it stays well below the reply budget however far away the terminal
+const MAX_GRACE: Duration = Duration::from_millis(250);
+
 /// A borrowed controlling terminal, switched into a mode where escape-sequence
 /// replies can be read back.
 pub struct Probe {
     tty: File,
     original: Termios,
+    grace: Duration,
 }
 
 impl Probe {
@@ -38,7 +47,11 @@ impl Probe {
         raw.special_codes[SpecialCodeIndex::VTIME] = 0;
         tcsetattr(&tty, OptionalActions::Now, &raw).ok()?;
 
-        Some(Probe { tty, original })
+        Some(Probe {
+            tty,
+            original,
+            grace: DRAIN_GRACE,
+        })
     }
 
     /// Send `query` and accumulate the reply until `done` accepts it or
@@ -49,12 +62,42 @@ impl Probe {
         budget: Duration,
         done: impl Fn(&[u8]) -> bool,
     ) -> Vec<u8> {
+        self.exchange(query, budget, done).0
+    }
+
+    /// Send `query` and report how long `done` took to accept the reply, or
+    /// `None` if it never did. For measuring the link rather than reading an
+    /// answer off it.
+    pub fn timed(
+        &mut self,
+        query: &[u8],
+        budget: Duration,
+        done: impl Fn(&[u8]) -> bool,
+    ) -> Option<Duration> {
+        self.exchange(query, budget, done).1
+    }
+
+    /// Widen the drain window, for a terminal far enough away that
+    /// [`DRAIN_GRACE`] would restore the tty while a reply is still in
+    /// flight. Never narrows it, and never past [`MAX_GRACE`].
+    pub fn set_grace(&mut self, grace: Duration) {
+        self.grace = grace.clamp(DRAIN_GRACE, MAX_GRACE);
+    }
+
+    fn exchange(
+        &mut self,
+        query: &[u8],
+        budget: Duration,
+        done: impl Fn(&[u8]) -> bool,
+    ) -> (Vec<u8>, Option<Duration>) {
         let mut got = Vec::with_capacity(512);
+        let sent = Instant::now();
         if self.tty.write_all(query).is_err() {
-            return got;
+            return (got, None);
         }
 
-        let deadline = Instant::now() + budget;
+        let deadline = sent + budget;
+        let mut answered = None;
         let mut buf = [0u8; 256];
         while got.len() < 4096 {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
@@ -72,6 +115,7 @@ impl Probe {
                 Err(_) => break,
             }
             if done(&got) {
+                answered = Some(sent.elapsed());
                 break;
             }
         }
@@ -79,7 +123,7 @@ impl Probe {
         // whether we finished or timed out, the terminal may still be mid
         // reply, and anything left behind reaches the shell
         self.drain();
-        got
+        (got, answered)
     }
 
     /// Read whatever the terminal has sent, waiting at most `budget` for the
@@ -124,7 +168,7 @@ impl Probe {
     }
 
     fn drain(&mut self) {
-        let deadline = Instant::now() + DRAIN_GRACE;
+        let deadline = Instant::now() + self.grace;
         let mut buf = [0u8; 256];
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             if !self.readable_within(left) {

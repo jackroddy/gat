@@ -14,6 +14,19 @@ use crate::term::{self, RawTty, Terminal};
 // microseconds and a signal handler cannot safely do anything but set a flag
 const TICK: Duration = Duration::from_millis(250);
 
+/// How long to wait for the rest of a keypress that arrived in pieces.
+//
+// a terminal writes an arrow key as one three-byte burst and a local pty
+// delivers it whole, but the network under an ssh session may split it across
+// two reads. a buffer cut after the escape byte decodes as the escape key,
+// which quits the viewer, so a buffer ending mid sequence is worth waiting on
+//
+// only a buffer that really does end in an escape pays this, which is either
+// a split sequence or the escape key itself. the remote window is the wider
+// one because a lost segment costs a round trip to retransmit
+const CONTINUATION: Duration = Duration::from_millis(50);
+const CONTINUATION_SSH: Duration = Duration::from_millis(200);
+
 /// Headroom transmitted beyond what the viewport shows, so zooming in has
 /// real pixels to enlarge rather than a blur.
 const ZOOM_HEADROOM: u32 = 2;
@@ -97,6 +110,11 @@ fn event_loop(
     background: [u8; 3],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cell = terminal.cell;
+    let continuation = if term::over_ssh() {
+        CONTINUATION_SSH
+    } else {
+        CONTINUATION
+    };
     let mut cells = term::current_cells();
     let mut index = 0usize;
     let mut shown: Option<Shown> = None;
@@ -144,7 +162,7 @@ fn event_loop(
             dirty = false;
         }
 
-        let input = tty.read_available(TICK);
+        let input = read_burst(tty, TICK, continuation);
         if input.is_empty() {
             let now = term::current_cells();
             if now != cells {
@@ -154,7 +172,7 @@ fn event_loop(
             continue;
         }
 
-        for key in decode_keys(&input) {
+        for key in keys_from(&input) {
             match key {
                 Key::Quit => return Ok(()),
                 Key::Next if index + 1 < files.len() => {
@@ -288,7 +306,36 @@ fn load(
     Ok(fb)
 }
 
-fn decode_keys(buf: &[u8]) -> Vec<Key> {
+/// Read one burst of input, waiting out a keypress delivered in pieces.
+fn read_burst(tty: &mut RawTty, first: Duration, rest: Duration) -> Vec<u8> {
+    let mut buf = tty.read_available(first);
+    while !buf.is_empty() && decode_keys(&buf).1 < buf.len() {
+        let more = tty.read_available(rest);
+        if more.is_empty() {
+            // nothing is in flight after all, so the tail is all there is
+            break;
+        }
+        buf.extend_from_slice(&more);
+    }
+    buf
+}
+
+/// Every key in `buf`, which is taken to be a complete burst.
+fn keys_from(buf: &[u8]) -> Vec<Key> {
+    let (mut keys, used) = decode_keys(buf);
+    // an escape still standing alone once [`read_burst`] has waited is the
+    // escape key, not the head of a sequence that has yet to arrive. anything
+    // longer left over is a sequence the terminal never finished, and stays
+    // dropped
+    if buf.len() - used == 1 && buf[used] == 0x1b {
+        keys.push(Key::Quit);
+    }
+    keys
+}
+
+/// Decode the keys in `buf`, and report how many bytes were consumed. A
+/// trailing escape sequence that is not yet whole is left unconsumed.
+fn decode_keys(buf: &[u8]) -> (Vec<Key>, usize) {
     let mut keys = Vec::new();
     let mut i = 0;
     while i < buf.len() {
@@ -320,6 +367,11 @@ fn decode_keys(buf: &[u8]) -> Vec<Key> {
             i = end + 1;
             continue;
         }
+        // an escape with nothing behind it may be the whole keypress or may
+        // be the head of a sequence still on the wire; the caller settles it
+        if buf[i] == 0x1b && i + 1 == buf.len() {
+            break;
+        }
         match buf[i] {
             b'q' | 0x1b | 0x03 => keys.push(Key::Quit),
             b'h' => keys.push(Key::Pan(-0.2, 0.0)),
@@ -335,7 +387,7 @@ fn decode_keys(buf: &[u8]) -> Vec<Key> {
         }
         i += 1;
     }
-    keys
+    (keys, i)
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -423,29 +475,52 @@ mod tests {
 
     #[test]
     fn graphics_acknowledgements_are_not_read_as_keys() {
-        let keys = decode_keys(b"\x1b_Gi=31,I=1;OK\x1b\\");
+        let keys = keys_from(b"\x1b_Gi=31,I=1;OK\x1b\\");
         assert!(keys.is_empty());
 
-        let mixed = decode_keys(b"\x1b_Gi=31;OK\x1b\\q");
+        let mixed = keys_from(b"\x1b_Gi=31;OK\x1b\\q");
         assert!(matches!(mixed.as_slice(), [Key::Quit]));
     }
 
     #[test]
     fn arrow_keys_pan_and_modifiers_are_swallowed_whole() {
         assert!(matches!(
-            decode_keys(b"\x1b[A").as_slice(),
+            keys_from(b"\x1b[A").as_slice(),
             [Key::Pan(0.0, y)] if *y < 0.0
         ));
         // a modified arrow carries parameters before the final byte; the
         // parser must not mistake those digits for commands
         assert!(matches!(
-            decode_keys(b"\x1b[1;5C").as_slice(),
+            keys_from(b"\x1b[1;5C").as_slice(),
             [Key::Pan(x, 0.0)] if *x > 0.0
         ));
     }
 
     #[test]
     fn a_lone_escape_quits() {
-        assert!(matches!(decode_keys(b"\x1b").as_slice(), [Key::Quit]));
+        assert!(matches!(keys_from(b"\x1b").as_slice(), [Key::Quit]));
+    }
+
+    #[test]
+    fn an_arrow_key_split_by_the_network_is_not_a_quit() {
+        // the first half of a keypress that ssh delivered in two reads. it
+        // must be held back rather than decoded, or panning quits the viewer
+        let (keys, used) = decode_keys(b"\x1b");
+        assert!(keys.is_empty());
+        assert_eq!(used, 0, "the escape has to survive for the next read");
+
+        // and once the rest lands, it pans like any other arrow key
+        assert!(matches!(
+            keys_from(b"\x1b[A").as_slice(),
+            [Key::Pan(0.0, y)] if *y < 0.0
+        ));
+    }
+
+    #[test]
+    fn a_key_before_a_split_sequence_still_registers() {
+        // a burst cut mid sequence must not cost the keys ahead of the cut
+        let (keys, used) = decode_keys(b"n\x1b[");
+        assert!(matches!(keys.as_slice(), [Key::Next]));
+        assert_eq!(used, 1);
     }
 }

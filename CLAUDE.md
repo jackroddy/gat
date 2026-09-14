@@ -86,6 +86,16 @@ and where you cannot, drain the tty before restoring it. `TERM` alone does not
 settle which protocol a terminal speaks, because kitty and Ghostty are often run
 with `TERM=xterm-256color` to keep ssh working.
 
+Over ssh only `TERM` crosses the hop, so detection falls to the probe, and
+every question it asks now costs a network round trip. Measure one of those
+first, with a device status report that every terminal answers, and size the
+waits that follow from it. A terminal that leaves even that unanswered is
+treated as unable to display images, which is also the right answer for a
+multiplexer swallowing the sequences. `SSH_TTY` decides how long a reply may
+take before detection gives up. The same latency splits a keypress across two
+reads, so the viewer holds back a trailing escape instead of reading it as the
+escape key and quitting on the first arrow press.
+
 ## Testing
 
 Geometry and protocol serialization are pure functions, so unit-test them.
