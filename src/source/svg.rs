@@ -14,6 +14,18 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Framebuffer, Error> {
     let scale = (hints.max_w as f32 / size.width())
         .min(hints.max_h as f32 / size.height())
         .max(f32::MIN_POSITIVE);
+
+    rasterize(&tree, scale)
+}
+
+/// Draw `tree` at `scale` into a straight-alpha framebuffer.
+//
+// split out from load because the contain-fit above is a policy, not a fact
+// about rasterizing, and markdown needs a different one: it lays itself out at
+// the display width already, so scaling it again to fit the screen height
+// would shrink a long document until the text was unreadable
+pub fn rasterize(tree: &usvg::Tree, scale: f32) -> Result<Framebuffer, Error> {
+    let size = tree.size();
     let (w, h) = (
         (size.width() * scale).round().max(1.0) as u32,
         (size.height() * scale).round().max(1.0) as u32,
@@ -22,7 +34,7 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Framebuffer, Error> {
     let mut pixmap = tiny_skia::Pixmap::new(w, h)
         .ok_or_else(|| Error::Decode(format!("cannot allocate {w}x{h} pixmap")))?;
     resvg::render(
-        &tree,
+        tree,
         tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );

@@ -12,6 +12,8 @@ image = { version = "0.25", default-features = false }
 hayro = { version = "0.7", optional = true }
 resvg = { version = "0.48", optional = true, default-features = false }
 pdfium-render = { version = "0.9", optional = true, default-features = false, features = ["image_025", "thread_safe", "pdfium_latest"] }
+pulldown-cmark = { version = "0.13", optional = true, default-features = false }
+unicode-width = { version = "0.2", optional = true }
 
 [features]
 default = ["png", "jpeg", "pdf"]
@@ -20,6 +22,10 @@ jpeg = ["image/jpeg"]
 svg = ["dep:resvg", "resvg/text"]
 pdf = ["dep:hayro"]
 pdf-pdfium = ["dep:pdfium-render"]
+# markdown rasterizes through resvg, so it turns on the svg feature wholesale
+# rather than reaching for resvg directly: the extra .svg file support that
+# comes with it is harmless, and it keeps the cfg gating to one name
+markdown = ["dep:pulldown-cmark", "dep:unicode-width", "svg"]
 
 [profile.release]
 opt-level = 3

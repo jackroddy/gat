@@ -2,6 +2,8 @@ use std::path::Path;
 
 use crate::framebuffer::Framebuffer;
 
+#[cfg(feature = "markdown")]
+mod markdown;
 #[cfg(any(feature = "pdf", feature = "pdf-pdfium"))]
 mod pdf;
 #[cfg(feature = "svg")]
@@ -49,6 +51,13 @@ pub fn load(bytes: &[u8], path: &Path, #[cfg_attr(not(any(feature = "svg", featu
         #[cfg(not(any(feature = "pdf", feature = "pdf-pdfium")))]
         Format::Pdf => Err(Error::Unsupported("PDF (rebuild with --features pdf)")),
 
+        #[cfg(feature = "markdown")]
+        Format::Markdown => markdown::load(bytes, hints),
+        #[cfg(not(feature = "markdown"))]
+        Format::Markdown => Err(Error::Unsupported(
+            "markdown (rebuild with --features markdown)",
+        )),
+
         Format::Unknown => Err(Error::Unsupported("unrecognized file")),
     }
 }
@@ -57,6 +66,7 @@ enum Format {
     Raster,
     Svg,
     Pdf,
+    Markdown,
     Unknown,
 }
 
@@ -67,18 +77,34 @@ fn sniff(bytes: &[u8], path: &Path) -> Format {
     if bytes.starts_with(b"%PDF-") {
         return Format::Pdf;
     }
+    // the extension is consulted before the content probe below, not after.
+    // markdown has no magic number of its own, and a document *about* svg
+    // mentions <svg in its first paragraph, which the probe would otherwise
+    // read as an svg file
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if MARKDOWN_EXTENSIONS
+        .iter()
+        .any(|m| ext.eq_ignore_ascii_case(m))
+    {
+        return Format::Markdown;
+    }
+
     // SVG has no magic number, and the root element can sit behind an XML
     // declaration, a doctype, or comments
     let head = &bytes[..bytes.len().min(1024)];
     if find(head, b"<svg").is_some() {
         return Format::Svg;
     }
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(e) if e.eq_ignore_ascii_case("svg") => Format::Svg,
-        Some(e) if e.eq_ignore_ascii_case("pdf") => Format::Pdf,
+    match ext {
+        e if e.eq_ignore_ascii_case("svg") => Format::Svg,
+        e if e.eq_ignore_ascii_case("pdf") => Format::Pdf,
         _ => Format::Unknown,
     }
 }
+
+/// Extensions that mean markdown. There is no sniffing to fall back on, so an
+/// unrecognized text file stays unknown rather than being read as markdown.
+const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd"];
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)

@@ -1,8 +1,8 @@
 # rimg
 
-A small terminal image viewer in Rust, modeled on
+A small terminal viewer in Rust, modeled on
 [timg](https://github.com/hzeller/timg). It handles the Kitty graphics protocol,
-PNG, JPEG and PDF, plus SVG behind a feature flag. Nothing else.
+PNG, JPEG and PDF, plus SVG and Markdown behind feature flags. Nothing else.
 
 `timg/` is a checkout of the C++ original, kept for reference. It is a separate
 git repo and is excluded from this one. Read it; never edit it.
@@ -13,6 +13,7 @@ git repo and is excluded from this one. Read it; never edit it.
 cargo run -- img/roc.pdf            # interactive viewer
 cargo run -- --print img/roc.pdf    # one-shot render, then exit
 cargo run --features svg -- x.svg
+cargo run --features markdown -- README.md
 cargo build --release
 ```
 
@@ -25,6 +26,14 @@ WezTerm, or Konsole. Elsewhere the escape sequences print as garbage, so check
 `$TERM` before pasting output anywhere. `--force-kitty` skips detection, which
 is how you capture the escape sequences to a file and inspect them, and
 `--probe` prints what detection saw.
+
+Markdown is not styled terminal text, it is rasterized to pixels like a PDF
+page: headings at real sizes, tinted code blocks, and a place to put syntax
+colour later. Text is monospace throughout, so line breaking is arithmetic over
+one advance ratio rather than a shaping and measurement pass. The font is
+compiled in, because usvg's default Options carries an empty fontdb and
+`load_system_fonts` is gated out of this build. See
+`src/source/markdown/font.rs`.
 
 PDF goes through hayro, which is pure Rust, so the default build needs nothing
 installed. Build with `--features pdf-pdfium` to use pdfium instead. It covers
@@ -45,6 +54,11 @@ precedence.
   `load(bytes, hints) -> Framebuffer`. `source/mod.rs` sniffs the magic bytes
   and matches on what it finds. `source/pdf/` is the exception with two
   modules, one per backend, behind that same signature.
+- `src/source/markdown/` is the other exception, being a pipeline rather than a
+  decoder: `parse.rs` turns events into a block tree, `layout.rs` turns that
+  into a flat display list of positioned runs, and `to_svg.rs` turns that into
+  an SVG document for resvg. The middle step is deliberately free of SVG, so
+  replacing the backend means rewriting only the last one.
 - `src/term/` interrogates the terminal for its size in cells and in pixels, and
   for which graphics protocol it supports.
 - `src/render/kitty.rs` serializes a framebuffer into escape sequences, both
@@ -55,13 +69,22 @@ precedence.
 ## Design constraints
 
 Be stingy with dependencies, with one deliberate exception: PDF ships in the
-default build, though adding hayro grew the tree from 26 crates to 93 and the
-release binary from 700K to 4.5M. Anything further goes behind a feature that
-is off by default.
+default build, though adding hayro grew the tree to 77 crates and the release
+binary to 5.9M. Anything further goes behind a feature that is off by default.
+`svg` costs 28 more crates; `markdown` adds two on top of that plus 1.2M of
+compiled-in font.
 
 SVG and PDF carry no pixel size of their own, so rasterize them straight at
 display size. Scale a bitmap afterwards instead and you lose resolution the
 source still had.
+
+Markdown has no size in either direction: its height is a function of the width
+it is given. So it lays out at the display width and is drawn at 1:1, and
+anything past the display height is cut off rather than scaled away. Scaling is
+not an option because `geometry::fit` shrinks by the tighter axis, which would
+reduce a long document until the text was unreadable. Its font size is derived
+from the requested width rather than fixed, so the viewer's `ZOOM_HEADROOM`
+produces the same page with more pixels in it instead of a different wrapping.
 
 The viewer never re-encodes pixels. It transmits once, then pans and zooms by
 sending a new source rectangle for the stored image, which the terminal scales.
@@ -102,4 +125,9 @@ Geometry and protocol serialization are pure functions, so unit-test them.
 Decoders get small fixtures under `tests/data/`.
 
 No test can tell you whether an image looks right; that needs a real terminal
-and a human. `cargo run -- timg/img/sunflower-term.png` is the eyeball test.
+and a human. `cargo run -- timg/img/sunflower-term.png` is the eyeball test, and
+`cargo run --features markdown -- CLAUDE.md` is the one for markdown.
+
+Markdown has one test that is not about looks and still matters: a font that
+fails to load renders a perfectly valid, perfectly empty page, so something has
+to assert the framebuffer contains lit pixels at all.
