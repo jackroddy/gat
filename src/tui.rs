@@ -188,7 +188,7 @@ fn event_loop(
                             encoded,
                         }) => {
                             fresh.id = kitty::next_id();
-                            kitty::emit(out, &encoded, fresh.id, false)?;
+                            kitty::emit(out, &encoded, fresh.id, false, kitty::Quiet::ErrorsOnly)?;
                             view = View::reset(&fresh.image, fresh.kind, cells, cell);
                             // place the new image before dropping the old one,
                             // so the screen never shows the gap between them
@@ -246,6 +246,15 @@ fn event_loop(
                 dirty = true;
             }
             continue;
+        }
+
+        // a terminal that refused the image answers with an APC carrying an
+        // error. it arrives mixed in with the keyboard, and used to be skipped
+        // along with the acknowledgements, which is how a refusal turned into
+        // a blank screen and no explanation
+        if let Some(complaint) = graphics_error(&input) {
+            failure = Some(complaint);
+            dirty = true;
         }
 
         for key in keys_from(&input) {
@@ -481,6 +490,30 @@ fn status_line(out: &mut impl Write, cells: (u32, u32), text: &str) -> std::io::
     out.write_all(text.chars().take(width).collect::<String>().as_bytes())
 }
 
+/// The terminal's complaint about a graphics command, if `buf` holds one.
+//
+// the protocol answers in an APC of the form ESC _ G <key>=<value>,... ;
+// <message> ESC \, where the message is OK on success and something like
+// ENOENT or EINVAL otherwise. Only the failures are interesting, and only
+// because the alternative is a blank screen with nothing said about it.
+fn graphics_error(buf: &[u8]) -> Option<String> {
+    let mut i = 0;
+    while let Some(start) = find(&buf[i..], b"\x1b_G").map(|p| i + p) {
+        let Some(end) = find(&buf[start..], b"\x1b\\").map(|p| start + p) else {
+            break;
+        };
+        let body = &buf[start + 3..end];
+        if let Some(semi) = body.iter().position(|&c| c == b';') {
+            let message = String::from_utf8_lossy(&body[semi + 1..]);
+            if !message.is_empty() && message != "OK" {
+                return Some(format!("terminal refused the image: {message}"));
+            }
+        }
+        i = end + 2;
+    }
+    None
+}
+
 /// Read one burst of input, waiting out a keypress delivered in pieces.
 fn read_burst(tty: &mut RawTty, first: Duration, rest: Duration) -> Vec<u8> {
     let mut buf = tty.read_available(first);
@@ -581,6 +614,33 @@ mod tests {
 
     fn view(zoom: f64, cx: f64, cy: f64) -> View {
         View { zoom, cx, cy }
+    }
+
+    #[test]
+    fn a_refused_image_is_reported_rather_than_skipped() {
+        // this is the whole point: a terminal that will not take the image
+        // says so, and the viewer used to throw the sentence away and show an
+        // empty screen instead
+        let refusal = b"\x1b_Gi=31;EINVAL:image too large\x1b\\";
+        let got = graphics_error(refusal).expect("refusal was not noticed");
+        assert!(got.contains("EINVAL"), "{got}");
+        assert!(got.contains("too large"), "{got}");
+    }
+
+    #[test]
+    fn an_acknowledgement_is_not_an_error() {
+        assert_eq!(graphics_error(b"\x1b_Gi=31,I=1;OK\x1b\\"), None);
+        assert_eq!(graphics_error(b"hello"), None);
+        // a half-arrived reply must not be read as a complaint either
+        assert_eq!(graphics_error(b"\x1b_Gi=31;EINV"), None);
+    }
+
+    #[test]
+    fn a_refusal_is_found_even_mixed_in_with_typing() {
+        let mixed = b"j\x1b_Gi=7;ENOMEM\x1b\\k";
+        assert!(graphics_error(mixed).is_some());
+        // and the keys around it still decode
+        assert_eq!(keys_from(mixed).len(), 2);
     }
 
     #[test]

@@ -58,19 +58,51 @@ pub fn encode(fb: &Framebuffer) -> io::Result<Encoded> {
 }
 
 fn send(out: &mut impl Write, fb: &Framebuffer, id: u32, display: bool) -> io::Result<()> {
-    emit(out, &encode(fb)?, id, display)
+    // the one-shot path writes and exits with nobody left to read a reply, so
+    // it keeps asking for silence
+    emit(out, &encode(fb)?, id, display, Quiet::Fully)
+}
+
+/// How much the terminal should say back about a transmission.
+//
+// q=2 suppresses successes and failures alike, which sounds tidy and means a
+// terminal that refuses an image -- too large, out of memory, protocol not
+// really supported -- refuses it silently, and the viewer shows an empty
+// screen with no way to find out why. Anything with a reader attached should
+// ask for the errors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Quiet {
+    /// q=2: say nothing, for a caller that will not be listening.
+    Fully,
+    /// q=1: successes are noise, failures are not.
+    ErrorsOnly,
+}
+
+impl Quiet {
+    fn code(self) -> u8 {
+        match self {
+            Quiet::Fully => 2,
+            Quiet::ErrorsOnly => 1,
+        }
+    }
 }
 
 /// Write an already-compressed image as the protocol's chunked escapes.
-pub fn emit(out: &mut impl Write, img: &Encoded, id: u32, display: bool) -> io::Result<()> {
+pub fn emit(
+    out: &mut impl Write,
+    img: &Encoded,
+    id: u32,
+    display: bool,
+    quiet: Quiet,
+) -> io::Result<()> {
+    let q = quiet.code();
     let Encoded { w, h, payload } = img;
     let mut chunks = payload.chunks(RAW_CHUNK).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
         let more = u8::from(chunks.peek().is_some());
         if first {
-            // f=32 RGBA, o=z zlib payload, q=2 suppress the failure reply we
-            // are not going to read.
+            // f=32 RGBA, o=z zlib payload.
             //
             // C=1 stops the terminal advancing the cursor itself. its
             // default, C=0, moves right by the placement's columns and down
@@ -80,11 +112,11 @@ pub fn emit(out: &mut impl Write, img: &Encoded, id: u32, display: bool) -> io::
             let action = if display { "T,C=1" } else { "t" };
             write!(
                 out,
-                "\x1b_Ga={action},i={id},q=2,f=32,o=z,s={w},v={h},m={more};"
+                "\x1b_Ga={action},i={id},q={q},f=32,o=z,s={w},v={h},m={more};"
             )?;
             first = false;
         } else {
-            write!(out, "\x1b_Gq=2,m={more};")?;
+            write!(out, "\x1b_Gq={q},m={more};")?;
         }
         out.write_all(B64.encode(chunk).as_bytes())?;
         out.write_all(b"\x1b\\")?;
