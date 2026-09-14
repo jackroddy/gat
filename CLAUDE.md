@@ -64,6 +64,8 @@ precedence.
   for which graphics protocol it supports.
 - `src/render/kitty.rs` serializes a framebuffer into escape sequences, both
   the one-shot `a=T` and the viewer's `a=t` transmit plus `a=p` placements.
+  `encode` (compress) is split from `emit` (write) so the expensive half can
+  run off the main thread; only `emit` touches the terminal.
 - `src/tui.rs` is the viewer: the alternate screen, the key loop, and the map
   from zoom and pan to a source rectangle.
 
@@ -111,6 +113,19 @@ megabytes per frame, so think hard before moving redrawing back into Rust.
 Reuse one placement id and let the new placement replace the old one. Delete
 the old one first and the background shows through the gap, which reads as a
 flash on every keypress.
+
+Decoding happens on a worker thread, and so does compressing, because the two
+are comparable: on a large markdown page the zlib pass can cost more than the
+render. Leaving compression on the main thread would freeze the spinner for
+exactly the stretch it exists to cover. The viewer keeps only the write, since
+only the write touches the terminal.
+
+Say something during a wait, but not during a short one. A load under
+`PATIENCE` finishes before the eye notices and flashing a spinner at it reads
+as a stutter; past it, a blank alternate screen with the cursor hidden is
+indistinguishable from a hang. Show elapsed seconds too: that is what tells
+someone "slow" from "wedged". Because the work is off-thread, `q` answers
+during a load rather than after it.
 
 No traits with one implementor. Formats vary along one axis, bytes in and
 framebuffer out, so they are an enum and a `match` rather than a

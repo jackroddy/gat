@@ -35,16 +35,35 @@ pub fn write(out: &mut impl Write, fb: &Framebuffer, id: u32) -> io::Result<()> 
     send(out, fb, id, true)
 }
 
-/// Store `fb` under `id` without displaying it. Pair with [`place`].
-pub fn transmit(out: &mut impl Write, fb: &Framebuffer, id: u32) -> io::Result<()> {
-    send(out, fb, id, false)
+/// A framebuffer compressed and ready to be written out.
+//
+// kept separate from writing it because compressing a full-screen image takes
+// long enough to be worth doing off the main thread, where it does not stop
+// the viewer from drawing or from answering the keyboard
+pub struct Encoded {
+    pub w: u32,
+    pub h: u32,
+    payload: Vec<u8>,
+}
+
+/// Compress `fb`. Does no I/O, so this is the half a worker thread can do.
+pub fn encode(fb: &Framebuffer) -> io::Result<Encoded> {
+    let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
+    z.write_all(fb.as_raw())?;
+    Ok(Encoded {
+        w: fb.width(),
+        h: fb.height(),
+        payload: z.finish()?,
+    })
 }
 
 fn send(out: &mut impl Write, fb: &Framebuffer, id: u32, display: bool) -> io::Result<()> {
-    let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
-    z.write_all(fb.as_raw())?;
-    let payload = z.finish()?;
+    emit(out, &encode(fb)?, id, display)
+}
 
+/// Write an already-compressed image as the protocol's chunked escapes.
+pub fn emit(out: &mut impl Write, img: &Encoded, id: u32, display: bool) -> io::Result<()> {
+    let Encoded { w, h, payload } = img;
     let mut chunks = payload.chunks(RAW_CHUNK).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
@@ -61,9 +80,7 @@ fn send(out: &mut impl Write, fb: &Framebuffer, id: u32, display: bool) -> io::R
             let action = if display { "T,C=1" } else { "t" };
             write!(
                 out,
-                "\x1b_Ga={action},i={id},q=2,f=32,o=z,s={w},v={h},m={more};",
-                w = fb.width(),
-                h = fb.height(),
+                "\x1b_Ga={action},i={id},q=2,f=32,o=z,s={w},v={h},m={more};"
             )?;
             first = false;
         } else {

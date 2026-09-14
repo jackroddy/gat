@@ -1,6 +1,7 @@
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::framebuffer::{self, Framebuffer};
 use crate::geometry::CellSize;
@@ -103,6 +104,35 @@ impl View {
     }
 }
 
+/// The spinner's frames, and how long each is shown.
+//
+// braille cycles read as motion at a size that costs one cell, and every
+// terminal that speaks the graphics protocol has the glyphs. the interval is
+// short enough to look alive without making the poll below busy
+const SPINNER: [char; 10] = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}',
+                             '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}'];
+const SPIN_TICK: Duration = Duration::from_millis(80);
+
+/// How long a load may take before it is worth saying anything.
+//
+// most files decode faster than the eye notices, and flashing a spinner at
+// them reads as a stutter. only a wait long enough to look like a hang is
+// worth announcing
+const PATIENCE: Duration = Duration::from_millis(120);
+
+/// A decode running on a worker thread.
+struct Loading {
+    done: mpsc::Receiver<Result<Ready, String>>,
+    began: Instant,
+}
+
+/// What a worker hands back: decoded, and already compressed, since squeezing
+/// a full-screen image is most of the wait and does no I/O.
+struct Ready {
+    shown: Shown,
+    encoded: kitty::Encoded,
+}
+
 enum Key {
     Quit,
     Pan(f64, f64),
@@ -136,33 +166,57 @@ fn event_loop(
     };
     let mut load_wanted = true;
     let mut dirty = true;
+    let mut loading: Option<Loading> = None;
 
     loop {
         if load_wanted {
             load_wanted = false;
             failure = None;
-            match load(&files[index], cells, cell, background) {
-                Ok(mut fresh) => {
-                    fresh.id = kitty::next_id();
-                    kitty::transmit(out, &fresh.image, fresh.id)?;
-                    view = View::reset(&fresh.image, fresh.kind, cells, cell);
-                    // place the new image before dropping the old one, so the
-                    // screen never shows the gap between them
-                    let previous = shown.replace(fresh);
-                    draw(out, &shown, &view, cells, cell, files, index, &failure)?;
-                    if let Some(old) = previous {
-                        kitty::forget(out, old.id)?;
+            // replacing the job drops the old receiver, so a worker the user
+            // has already navigated away from finds nobody to send to and its
+            // result never lands
+            loading = Some(spawn_load(files[index].clone(), cells, cell, background));
+        }
+
+        if let Some(job) = &loading {
+            match job.done.try_recv() {
+                Ok(result) => {
+                    loading = None;
+                    match result {
+                        Ok(Ready {
+                            shown: mut fresh,
+                            encoded,
+                        }) => {
+                            fresh.id = kitty::next_id();
+                            kitty::emit(out, &encoded, fresh.id, false)?;
+                            view = View::reset(&fresh.image, fresh.kind, cells, cell);
+                            // place the new image before dropping the old one,
+                            // so the screen never shows the gap between them
+                            let previous = shown.replace(fresh);
+                            draw(out, &shown, &view, cells, cell, files, index, &failure)?;
+                            if let Some(old) = previous {
+                                kitty::forget(out, old.id)?;
+                            }
+                            out.flush()?;
+                            dirty = false;
+                        }
+                        Err(e) => {
+                            failure = Some(e);
+                            if let Some(old) = shown.take() {
+                                kitty::forget(out, old.id)?;
+                            }
+                            dirty = true;
+                        }
                     }
-                    out.flush()?;
-                    dirty = false;
                 }
-                Err(e) => {
-                    failure = Some(e.to_string());
-                    if let Some(old) = shown.take() {
-                        kitty::forget(out, old.id)?;
-                    }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // the worker died without answering, which should not
+                    // happen, but hanging on a spinner forever would be worse
+                    failure = Some("decode failed".into());
+                    loading = None;
                     dirty = true;
                 }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
 
@@ -172,7 +226,19 @@ fn event_loop(
             dirty = false;
         }
 
-        let input = read_burst(tty, TICK, continuation);
+        // while a decode is running the loop polls fast enough to animate;
+        // otherwise it sits on the keyboard until something happens
+        let wait = match &loading {
+            Some(job) if job.began.elapsed() >= PATIENCE => {
+                status_line(out, cells, &spinner_text(files, index, job.began))?;
+                out.flush()?;
+                SPIN_TICK
+            }
+            Some(_) => SPIN_TICK,
+            None => TICK,
+        };
+
+        let input = read_burst(tty, wait, continuation);
         if input.is_empty() {
             let now = term::current_cells();
             if now != cells {
@@ -294,9 +360,7 @@ fn draw(
             view.zoom * 100.0
         ),
     };
-    let width = cells.0 as usize;
-    write!(out, "\x1b[{};1H\x1b[K", cells.1)?;
-    out.write_all(status.chars().take(width).collect::<String>().as_bytes())
+    status_line(out, cells, &status)
 }
 
 fn load(
@@ -354,6 +418,67 @@ fn load(
         id: 0,
         kind,
     })
+}
+
+/// Decode and compress `path` on a worker thread.
+//
+// both halves go here, not just the decode. compressing a full-screen image is
+// most of the wait on a fast machine and all of it on a slow one, so leaving
+// it on the main thread would freeze the spinner for exactly the stretch the
+// spinner exists to cover. only the write stays behind, because only the write
+// touches the terminal
+fn spawn_load(
+    path: PathBuf,
+    cells: (u32, u32),
+    cell: CellSize,
+    background: [u8; 3],
+) -> Loading {
+    let (tx, done) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = load(&path, cells, cell, background)
+            .map_err(|e| e.to_string())
+            .and_then(|shown| {
+                kitty::encode(&shown.image)
+                    .map(|encoded| Ready { shown, encoded })
+                    .map_err(|e| e.to_string())
+            });
+        // the viewer may have quit while we worked; nobody left to tell
+        let _ = tx.send(result);
+    });
+    Loading {
+        done,
+        began: Instant::now(),
+    }
+}
+
+/// Which spinner glyph belongs to a wait of `elapsed`.
+fn spinner_frame(elapsed: Duration) -> char {
+    let step = (elapsed.as_millis() / SPIN_TICK.as_millis()) as usize;
+    SPINNER[step % SPINNER.len()]
+}
+
+/// What to say while waiting.
+fn spinner_text(files: &[PathBuf], index: usize, began: Instant) -> String {
+    let frame = spinner_frame(began.elapsed());
+    let name = files[index]
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // the elapsed time is the part that distinguishes "slow" from "wedged",
+    // which is the question someone watching a spinner is actually asking
+    format!(
+        "{frame} rendering {name}  [{}/{}]  {:.1}s  q quits",
+        index + 1,
+        files.len(),
+        began.elapsed().as_secs_f32(),
+    )
+}
+
+/// Write `text` on the bottom row, clipped to the width.
+fn status_line(out: &mut impl Write, cells: (u32, u32), text: &str) -> std::io::Result<()> {
+    write!(out, "\x1b[{};1H\x1b[K", cells.1)?;
+    let width = cells.0 as usize;
+    out.write_all(text.chars().take(width).collect::<String>().as_bytes())
 }
 
 /// Read one burst of input, waiting out a keypress delivered in pieces.
@@ -456,6 +581,25 @@ mod tests {
 
     fn view(zoom: f64, cx: f64, cy: f64) -> View {
         View { zoom, cx, cy }
+    }
+
+    #[test]
+    fn the_spinner_cycles_and_never_leaves_the_frame_list() {
+        assert_eq!(spinner_frame(Duration::ZERO), SPINNER[0]);
+        assert_eq!(spinner_frame(SPIN_TICK), SPINNER[1]);
+        // it has to wrap rather than panic, and a long wait is exactly when
+        // an index out of range would be least welcome
+        assert_eq!(spinner_frame(SPIN_TICK * SPINNER.len() as u32), SPINNER[0]);
+        assert_eq!(spinner_frame(Duration::from_secs(3600)), SPINNER[0]);
+    }
+
+    #[test]
+    fn nothing_is_said_about_a_wait_too_short_to_notice() {
+        // flashing a spinner at a decode that finishes in a frame or two reads
+        // as a stutter, so PATIENCE has to be long enough to sit out the fast
+        // path and short enough to beat the eye's patience
+        assert!(PATIENCE >= SPIN_TICK);
+        assert!(PATIENCE < Duration::from_millis(500));
     }
 
     #[test]
