@@ -14,7 +14,7 @@ mod to_svg;
 use resvg::usvg;
 
 use crate::framebuffer::Framebuffer;
-use crate::source::{Error, Hints, svg};
+use crate::source::{Error, Hints, Overflow, svg};
 
 /// How many columns of text a page aims to be wide, whatever pixel width the
 /// caller asks for.
@@ -33,10 +33,13 @@ const MAX_SIZE: f32 = 40.0;
 
 /// A ceiling on the page, independent of what the caller asked for.
 //
-// max_w by max_h with the viewer's headroom on a 4K screen is well over a
-// hundred megabytes of RGBA. The height is cut to respect this before anything
-// is allocated.
-const MAX_PIXELS: u32 = 32_000_000;
+// the viewer asks for the whole document so that it has something to scroll
+// through, which makes the page as long as the file. Something has to stop
+// that, and this is it: the height is cut to respect it before anything is
+// allocated. 16 megapixels is 64MB of framebuffer and, at a typical width,
+// somewhere north of fifteen thousand pixels of text, which is a long document
+// before anyone notices the end is missing.
+const MAX_PIXELS: u32 = 16_000_000;
 
 pub fn load(bytes: &[u8], hints: Hints) -> Result<Framebuffer, Error> {
     // invalid bytes become U+FFFD rather than failing the whole file: markdown
@@ -76,15 +79,22 @@ fn theme_for(width: f32) -> layout::Theme {
 
 /// How tall to actually draw, given how tall the content wants to be.
 //
-// truncation rather than scaling, which looks like the wrong answer until you
-// follow what the caller does with the result. geometry::fit shrinks by
-// min(w_frac, h_frac), so handing back a six thousand pixel page for an eight
-// hundred pixel viewport would get it scaled to an eighth of its size and the
-// text would be mush. The viewer does the same at zoom 1.0. Cutting instead
-// leaves fit with nothing to do and the text lands at 1:1, which is the same
-// bargain PDF makes by rendering only the first page.
+// for the one-shot render, truncation rather than scaling: geometry::fit
+// shrinks by min(w_frac, h_frac), so handing back a six thousand pixel page
+// for an eight hundred pixel viewport would scale it to an eighth and the text
+// would be mush. Cutting leaves fit with nothing to do and lands text at 1:1,
+// the same bargain PDF makes by rendering only the first page.
+//
+// the viewer is the opposite case and asks to Keep: it transmits once and pans
+// over the result, so cutting the page to the screen would delete exactly the
+// part panning exists to reach, and no key would ever show it.
 fn clip(content_h: f32, hints: Hints) -> f32 {
-    let by_request = hints.max_h.max(1) as f32;
+    let by_request = match hints.overflow {
+        // the viewer pans, so the page it gets is the whole document and the
+        // screen height is none of its business
+        Overflow::Keep => f32::INFINITY,
+        Overflow::Clip => hints.max_h.max(1) as f32,
+    };
     let by_memory = (MAX_PIXELS / hints.max_w.max(1)) as f32;
     content_h.min(by_request).min(by_memory).max(1.0)
 }
@@ -111,6 +121,7 @@ mod tests {
         Hints {
             max_w: w,
             max_h: h,
+            overflow: Overflow::Clip,
         }
     }
 
@@ -121,6 +132,29 @@ mod tests {
         assert_eq!(clip(6000.0, hints(800, 600)), 600.0);
         // and a short one keeps its own height
         assert_eq!(clip(200.0, hints(800, 600)), 200.0);
+    }
+
+    #[test]
+    fn the_viewer_gets_the_whole_document_and_the_one_shot_gets_a_screenful() {
+        // the bug this guards: cutting the page to the screen for the viewer
+        // deleted exactly the part panning exists to reach, so a long document
+        // could never be scrolled past its first screen
+        let keep = Hints {
+            overflow: Overflow::Keep,
+            ..hints(800, 600)
+        };
+        assert_eq!(clip(6000.0, keep), 6000.0);
+        assert_eq!(clip(6000.0, hints(800, 600)), 600.0);
+    }
+
+    #[test]
+    fn keeping_overflow_still_respects_the_pixel_ceiling() {
+        // Keep means "the screen height is not the limit", not "no limit"
+        let keep = Hints {
+            overflow: Overflow::Keep,
+            ..hints(1000, 600)
+        };
+        assert_eq!(clip(f32::INFINITY, keep), (MAX_PIXELS / 1000) as f32);
     }
 
     #[test]

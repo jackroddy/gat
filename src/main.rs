@@ -92,6 +92,9 @@ fn show(
     let hints = source::Hints {
         max_w: budget.cols * budget.cell.w,
         max_h: budget.rows * budget.cell.h,
+        // this writes where the cursor is and returns; anything past the
+        // screen has nowhere to go
+        overflow: source::Overflow::Clip,
     };
     let decoded = source::load(&bytes, path, hints)?;
 

@@ -79,12 +79,23 @@ display size. Scale a bitmap afterwards instead and you lose resolution the
 source still had.
 
 Markdown has no size in either direction: its height is a function of the width
-it is given. So it lays out at the display width and is drawn at 1:1, and
-anything past the display height is cut off rather than scaled away. Scaling is
-not an option because `geometry::fit` shrinks by the tighter axis, which would
-reduce a long document until the text was unreadable. Its font size is derived
-from the requested width rather than fixed, so the viewer's `ZOOM_HEADROOM`
-produces the same page with more pixels in it instead of a different wrapping.
+it is given, so its font size is derived from the width asked for rather than
+fixed. Scaling a long page down is never the answer: `geometry::fit` shrinks by
+the tighter axis, which would reduce a document until the text was unreadable.
+
+The two callers therefore want different things, which is what `Hints.overflow`
+is for. The one-shot render writes at the cursor and has nowhere to put the
+rest, so it clips to a screenful, the same bargain PDF makes by rendering only
+page one. The viewer transmits once and pans, so for it the framebuffer *is*
+the scrollback: it asks for the whole document, fits it on width alone, and
+scrolling is just panning. Clipping there would delete exactly the part panning
+exists to reach.
+
+For the same reason the viewer gives a document no `ZOOM_HEADROOM`. Headroom
+buys real pixels to zoom into, which a photo has and a document does not: ask
+markdown for double the width and it returns the same words at double the size,
+to be drawn at half. That is four times the pixels for an identical-looking
+page. The cost of asking is why `MAX_PIXELS` exists at all.
 
 The viewer never re-encodes pixels. It transmits once, then pans and zooms by
 sending a new source rectangle for the stored image, which the terminal scales.

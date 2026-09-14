@@ -71,6 +71,7 @@ impl Drop for Screen {
 struct Shown {
     image: Framebuffer,
     id: u32,
+    kind: source::Kind,
 }
 
 /// Which part of the image the viewer is looking at.
@@ -84,12 +85,21 @@ struct View {
 }
 
 impl View {
-    fn reset(image: &Framebuffer) -> View {
-        View {
+    fn reset(image: &Framebuffer, kind: source::Kind, cells: (u32, u32), cell: CellSize) -> View {
+        let mut view = View {
             zoom: 1.0,
             cx: image.width() as f64 / 2.0,
             cy: image.height() as f64 / 2.0,
+        };
+        // a picture opens centred, because the middle is where the subject is.
+        // a document opens at the top, because that is where the reading
+        // starts, and centring a long one would drop the reader into the
+        // middle of it
+        if kind == source::Kind::Document {
+            let p = placement(image, kind, &view, cells, cell);
+            view.cy = p.src_h as f64 / 2.0;
         }
+        view
     }
 }
 
@@ -132,13 +142,13 @@ fn event_loop(
             load_wanted = false;
             failure = None;
             match load(&files[index], cells, cell, background) {
-                Ok(image) => {
-                    let id = kitty::next_id();
-                    kitty::transmit(out, &image, id)?;
-                    view = View::reset(&image);
+                Ok(mut fresh) => {
+                    fresh.id = kitty::next_id();
+                    kitty::transmit(out, &fresh.image, fresh.id)?;
+                    view = View::reset(&fresh.image, fresh.kind, cells, cell);
                     // place the new image before dropping the old one, so the
                     // screen never shows the gap between them
-                    let previous = shown.replace(Shown { image, id });
+                    let previous = shown.replace(fresh);
                     draw(out, &shown, &view, cells, cell, files, index, &failure)?;
                     if let Some(old) = previous {
                         kitty::forget(out, old.id)?;
@@ -186,7 +196,7 @@ fn event_loop(
                 Key::Next | Key::Prev => {}
                 Key::Reset => {
                     if let Some(s) = &shown {
-                        view = View::reset(&s.image);
+                        view = View::reset(&s.image, s.kind, cells, cell);
                     }
                     dirty = true;
                 }
@@ -196,7 +206,7 @@ fn event_loop(
                 }
                 Key::Pan(dx, dy) => {
                     if let Some(s) = &shown {
-                        let p = placement(&s.image, &view, cells, cell);
+                        let p = placement(&s.image, s.kind, &view, cells, cell);
                         view.cx += dx * p.src_w as f64;
                         view.cy += dy * p.src_h as f64;
                     }
@@ -212,15 +222,29 @@ fn event_loop(
 // the terminal does the scaling: the source rectangle is clipped to the image
 // and then stretched to fill the cell box, so panning and zooming cost one
 // escape sequence each and never re-encode a pixel
-fn placement(image: &Framebuffer, view: &View, cells: (u32, u32), cell: CellSize) -> Placement {
+fn placement(
+    image: &Framebuffer,
+    kind: source::Kind,
+    view: &View,
+    cells: (u32, u32),
+    cell: CellSize,
+) -> Placement {
     let (img_w, img_h) = (image.width() as f64, image.height() as f64);
     let (cols, rows) = (cells.0.max(1), cells.1.saturating_sub(1).max(1));
     let view_w = (cols * cell.w) as f64;
     let view_h = (rows * cell.h) as f64;
 
     // zoom 1.0 shows the whole image, but never enlarges it past its own
-    // pixels, which matches what the one-shot path does without --upscale
-    let base = (view_w / img_w).min(view_h / img_h).min(1.0);
+    // pixels, which matches what the one-shot path does without --upscale.
+    //
+    // a document is fitted on width alone. fitting its height too would shrink
+    // a long page until the text was unreadable, and would leave nothing to
+    // pan to, because the whole thing would already be on screen. width-only
+    // is what every pager does: full size, and scroll to read on
+    let base = match kind {
+        source::Kind::Document => (view_w / img_w).min(1.0),
+        source::Kind::Image => (view_w / img_w).min(view_h / img_h).min(1.0),
+    };
     let scale = base * view.zoom;
 
     let shown_w = (img_w * scale).min(view_w);
@@ -254,7 +278,7 @@ fn draw(
     out.write_all(b"\x1b[H\x1b[J")?;
 
     if let Some(s) = shown {
-        kitty::place(out, s.id, &placement(&s.image, view, cells, cell))?;
+        kitty::place(out, s.id, &placement(&s.image, s.kind, view, cells, cell))?;
     }
 
     let name = files[index]
@@ -280,18 +304,40 @@ fn load(
     cells: (u32, u32),
     cell: CellSize,
     background: [u8; 3],
-) -> Result<Framebuffer, Box<dyn std::error::Error>> {
+) -> Result<Shown, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
+    let kind = source::kind(&bytes, path);
+
+    // headroom buys real pixels to zoom into, which a photo needs because its
+    // detail is already there to be found. a document has no such detail: it
+    // is drawn at whatever size it is asked for, and asking for double gives
+    // back the same words at double the size, to be displayed at half. That is
+    // four times the pixels for an identical-looking page, and on a long
+    // document it is the difference between a framebuffer of tens and of
+    // hundreds of megabytes
+    let headroom = match kind {
+        source::Kind::Document => 1,
+        source::Kind::Image => ZOOM_HEADROOM,
+    };
     let hints = source::Hints {
-        max_w: cells.0 * cell.w * ZOOM_HEADROOM,
-        max_h: cells.1 * cell.h * ZOOM_HEADROOM,
+        max_w: cells.0 * cell.w * headroom,
+        max_h: cells.1 * cell.h * headroom,
+        // the viewer pans over what it is given, so a flowed source should
+        // hand over the whole document rather than one screen of it
+        overflow: source::Overflow::Keep,
     };
     let decoded = source::load(&bytes, path, hints)?;
 
     // transmitting the full source of a large photo would burn the terminal's
-    // image quota for detail no zoom level reaches
+    // image quota for detail no zoom level reaches. a document is exempt: its
+    // height is the document, and shrinking it to a screenful would throw away
+    // the text that panning is for
+    let height_limit = match kind {
+        source::Kind::Document => f64::INFINITY,
+        source::Kind::Image => hints.max_h as f64,
+    };
     let scale = (hints.max_w as f64 / decoded.width() as f64)
-        .min(hints.max_h as f64 / decoded.height() as f64)
+        .min(height_limit / decoded.height() as f64)
         .min(1.0);
     let mut fb = if scale < 1.0 {
         framebuffer::resize(
@@ -303,7 +349,11 @@ fn load(
         decoded
     };
     framebuffer::flatten_onto(&mut fb, background);
-    Ok(fb)
+    Ok(Shown {
+        image: fb,
+        id: 0,
+        kind,
+    })
 }
 
 /// Read one burst of input, waiting out a keypress delivered in pieces.
@@ -409,9 +459,40 @@ mod tests {
     }
 
     #[test]
+    fn a_document_is_fitted_on_width_and_scrolls() {
+        // a picture wants to be seen whole, so it is fitted on both axes and
+        // has nowhere to pan at rest. a page of text fitted that way would be
+        // shrunk until it was unreadable, and would leave nothing to scroll to
+        let page = Framebuffer::new(900, 6000);
+        let v = view(1.0, 450.0, 200.0);
+
+        let doc = placement(&page, source::Kind::Document, &v, (100, 30), CELL);
+        assert!(
+            doc.src_h < 6000,
+            "a document showed its whole height at rest, so there is no scroll"
+        );
+
+        let pic = placement(&page, source::Kind::Image, &v, (100, 30), CELL);
+        assert_eq!(pic.src_h, 6000, "a picture should still be fitted whole");
+        assert!(
+            doc.src_h < pic.src_h,
+            "the document should show less at once than the fitted picture"
+        );
+    }
+
+    #[test]
+    fn a_document_opens_at_its_first_line() {
+        // centring a long document drops the reader into the middle of it
+        let page = Framebuffer::new(900, 6000);
+        let v = View::reset(&page, source::Kind::Document, (100, 30), CELL);
+        let p = placement(&page, source::Kind::Document, &v, (100, 30), CELL);
+        assert_eq!(p.src_y, 0, "document did not open at the top");
+    }
+
+    #[test]
     fn unzoomed_shows_the_whole_image() {
         let img = image(1000, 500);
-        let p = placement(&img, &view(1.0, 500.0, 250.0), (80, 25), CELL);
+        let p = placement(&img, source::Kind::Image, &view(1.0, 500.0, 250.0), (80, 25), CELL);
         assert_eq!((p.src_x, p.src_y), (0, 0));
         assert_eq!((p.src_w, p.src_h), (1000, 500));
     }
@@ -419,8 +500,8 @@ mod tests {
     #[test]
     fn zooming_in_shrinks_the_source_rectangle() {
         let img = image(1000, 500);
-        let wide = placement(&img, &view(1.0, 500.0, 250.0), (80, 25), CELL);
-        let close = placement(&img, &view(2.0, 500.0, 250.0), (80, 25), CELL);
+        let wide = placement(&img, source::Kind::Image, &view(1.0, 500.0, 250.0), (80, 25), CELL);
+        let close = placement(&img, source::Kind::Image, &view(2.0, 500.0, 250.0), (80, 25), CELL);
         assert!(close.src_w < wide.src_w && close.src_h < wide.src_h);
         // the axis that was already filling the viewport halves exactly; the
         // letterboxed axis shows less than half, because zooming first eats
@@ -433,7 +514,7 @@ mod tests {
     fn the_source_rectangle_keeps_the_display_box_aspect_ratio() {
         let img = image(1000, 500);
         for zoom in [1.0, 1.5, 2.0, 8.0] {
-            let p = placement(&img, &view(zoom, 500.0, 250.0), (80, 25), CELL);
+            let p = placement(&img, source::Kind::Image, &view(zoom, 500.0, 250.0), (80, 25), CELL);
             let src = p.src_w as f64 / p.src_h as f64;
             let dst = (p.cols * CELL.w) as f64 / (p.rows * CELL.h) as f64;
             assert!(
@@ -447,7 +528,7 @@ mod tests {
     fn the_cell_box_never_exceeds_the_viewport() {
         let img = image(4000, 3000);
         for zoom in [1.0, 2.0, 8.0, 32.0] {
-            let p = placement(&img, &view(zoom, 2000.0, 1500.0), (80, 25), CELL);
+            let p = placement(&img, source::Kind::Image, &view(zoom, 2000.0, 1500.0), (80, 25), CELL);
             assert!(p.cols <= 80, "cols {} at zoom {zoom}", p.cols);
             // one row is held back for the status line
             assert!(p.rows <= 24, "rows {} at zoom {zoom}", p.rows);
@@ -457,10 +538,10 @@ mod tests {
     #[test]
     fn panning_past_an_edge_clamps_inside_the_image() {
         let img = image(1000, 500);
-        let p = placement(&img, &view(4.0, -9000.0, -9000.0), (80, 25), CELL);
+        let p = placement(&img, source::Kind::Image, &view(4.0, -9000.0, -9000.0), (80, 25), CELL);
         assert_eq!((p.src_x, p.src_y), (0, 0));
 
-        let q = placement(&img, &view(4.0, 9000.0, 9000.0), (80, 25), CELL);
+        let q = placement(&img, source::Kind::Image, &view(4.0, 9000.0, 9000.0), (80, 25), CELL);
         assert_eq!(q.src_x + q.src_w, 1000);
         assert_eq!(q.src_y + q.src_h, 500);
     }
@@ -468,7 +549,7 @@ mod tests {
     #[test]
     fn a_small_image_is_not_enlarged_at_rest() {
         let img = image(40, 30);
-        let p = placement(&img, &view(1.0, 20.0, 15.0), (80, 25), CELL);
+        let p = placement(&img, source::Kind::Image, &view(1.0, 20.0, 15.0), (80, 25), CELL);
         assert_eq!((p.src_w, p.src_h), (40, 30));
         assert_eq!((p.cols, p.rows), (4, 2));
     }

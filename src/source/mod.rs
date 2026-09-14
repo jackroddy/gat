@@ -16,6 +16,35 @@ mod svg;
 pub struct Hints {
     pub max_w: u32,
     pub max_h: u32,
+    /// Only a flowed source can overflow, so only markdown reads this.
+    #[cfg_attr(not(feature = "markdown"), allow(dead_code))]
+    pub overflow: Overflow,
+}
+
+/// What the caller can do with content taller than `max_h`.
+//
+// only a flowed source can be taller than it was asked for, so only markdown
+// reads this. the distinction matters because the two callers differ: the
+// one-shot render writes into the scrollback at the cursor and has nowhere to
+// put the rest, while the viewer transmits once and pans, so for it the
+// framebuffer *is* the scrollback and cutting the page to the screen would
+// throw away the part panning exists to reach
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overflow {
+    Clip,
+    Keep,
+}
+
+/// Whether a source is a picture or a page of text.
+//
+// the viewer fits a picture to the screen, because seeing all of it at once is
+// the point. a document taller than the screen wants the opposite: full width,
+// 1:1, and pan to read on. Nothing else distinguishes them once both are
+// pixels, so the decoder has to say which it produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Image,
+    Document,
 }
 
 #[derive(Debug)]
@@ -32,6 +61,18 @@ impl std::fmt::Display for Error {
             Error::Unsupported(what) => write!(f, "unsupported format: {what}"),
             Error::Decode(msg) => write!(f, "{msg}"),
         }
+    }
+}
+
+/// What sort of thing this is, without decoding it.
+//
+// the viewer has to know before it asks: a document and a picture want
+// different sizes requested of them, so the answer cannot arrive with the
+// pixels. sniffing twice is cheap next to decoding once.
+pub fn kind(bytes: &[u8], path: &Path) -> Kind {
+    match sniff(bytes, path) {
+        Format::Markdown => Kind::Document,
+        _ => Kind::Image,
     }
 }
 
