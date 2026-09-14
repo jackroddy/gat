@@ -16,7 +16,7 @@ pulldown-cmark = { version = "0.13", optional = true, default-features = false }
 unicode-width = { version = "0.2", optional = true }
 
 [features]
-default = ["png", "jpeg", "pdf"]
+default = ["png", "jpeg", "pdf", "svg", "markdown"]
 png = ["image/png"]
 jpeg = ["image/jpeg"]
 svg = ["dep:resvg", "resvg/text"]
@@ -24,7 +24,10 @@ pdf = ["dep:hayro"]
 pdf-pdfium = ["dep:pdfium-render"]
 # markdown rasterizes through resvg, so it turns on the svg feature wholesale
 # rather than reaching for resvg directly: the extra .svg file support that
-# comes with it is harmless, and it keeps the cfg gating to one name
+# comes with it is harmless, and it keeps the cfg gating to one name.
+#
+# both are in `default`, so these names exist to be switched off with
+# --no-default-features rather than to be switched on
 markdown = ["dep:pulldown-cmark", "dep:unicode-width", "svg"]
 
 [profile.release]

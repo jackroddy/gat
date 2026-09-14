@@ -42,7 +42,7 @@ pub fn rasterize(tree: &usvg::Tree, scale: f32) -> Result<Framebuffer, Error> {
     // tiny-skia stores premultiplied alpha; the renderer and the compositor
     // both expect straight alpha
     let mut raw = pixmap.take();
-    for px in raw.chunks_exact_mut(4) {
+    for px in raw.as_chunks_mut::<4>().0 {
         let a = px[3] as u32;
         if a != 0 && a != 255 {
             for c in &mut px[..3] {

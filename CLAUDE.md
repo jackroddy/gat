@@ -2,7 +2,7 @@
 
 A small terminal viewer in Rust, modeled on
 [timg](https://github.com/hzeller/timg). It handles the Kitty graphics protocol,
-PNG, JPEG and PDF, plus SVG and Markdown behind feature flags. Nothing else.
+PNG, JPEG, PDF, SVG and Markdown. Nothing else.
 
 `timg/` is a checkout of the C++ original, kept for reference. It is a separate
 git repo and is excluded from this one. Read it; never edit it.
@@ -12,9 +12,10 @@ git repo and is excluded from this one. Read it; never edit it.
 ```
 cargo run -- img/roc.pdf            # interactive viewer
 cargo run -- --print img/roc.pdf    # one-shot render, then exit
-cargo run --features svg -- x.svg
-cargo run --features markdown -- README.md
+cargo run -- x.svg
+cargo run -- README.md
 cargo build --release
+cargo build --no-default-features --features png   # a smaller binary
 ```
 
 The viewer takes over the screen; `--print` writes the image where the cursor
@@ -27,7 +28,7 @@ WezTerm, or Konsole. Elsewhere the escape sequences print as garbage, so check
 is how you capture the escape sequences to a file and inspect them, and
 `--probe` prints what detection saw.
 
-Markdown is not styled terminal text, it is rasterized to pixels like a PDF
+Markdown is not styled terminal text; it is rasterized to pixels like a PDF
 page: headings at real sizes, tinted code blocks, and a place to put syntax
 colour later. Text is monospace throughout, so line breaking is arithmetic over
 one advance ratio rather than a shaping and measurement pass. The font is
@@ -68,11 +69,16 @@ precedence.
 
 ## Design constraints
 
-Be stingy with dependencies, with one deliberate exception: PDF ships in the
-default build, though adding hayro grew the tree to 77 crates and the release
-binary to 5.9M. Anything further goes behind a feature that is off by default.
-`svg` costs 28 more crates; `markdown` adds two on top of that plus 1.2M of
-compiled-in font.
+Be stingy with dependencies, but not at the cost of the thing working out of
+the box. Every format ships in the default build, which costs 106 crates and a
+9.6M binary: hayro is most of the crates, resvg most of the rest, and markdown
+adds only two beyond what resvg already dragged in, plus 1.2M of compiled-in
+font. For comparison, `--no-default-features` is 18 crates.
+
+Each format is still a named feature, so the cost is refusable. But those names
+exist to be switched *off* with `--no-default-features`, not to be switched on:
+a format nobody can use without rebuilding might as well not be supported. Be
+stingy about what goes in the list at all, not about what a normal build gets.
 
 SVG and PDF carry no pixel size of their own, so rasterize them straight at
 display size. Scale a bitmap afterwards instead and you lose resolution the
@@ -137,7 +143,7 @@ Decoders get small fixtures under `tests/data/`.
 
 No test can tell you whether an image looks right; that needs a real terminal
 and a human. `cargo run -- timg/img/sunflower-term.png` is the eyeball test, and
-`cargo run --features markdown -- CLAUDE.md` is the one for markdown.
+`cargo run -- CLAUDE.md` is the one for markdown.
 
 Markdown has one test that is not about looks and still matters: a font that
 fails to load renders a perfectly valid, perfectly empty page, so something has
