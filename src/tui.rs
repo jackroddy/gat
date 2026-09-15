@@ -422,6 +422,7 @@ fn load(
             source::Kind::Document => u32::MAX,
             source::Kind::Image => cells.1 * cell.h * headroom,
         },
+        cell,
     };
     let decoded = source::load(&bytes, path, hints)?.fb;
 

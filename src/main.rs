@@ -93,6 +93,7 @@ fn show(
     let hints = source::Hints {
         max_w: budget.cols * budget.cell.w,
         max_h: budget.rows * budget.cell.h,
+        cell: budget.cell,
     };
     let decoded = source::load(&bytes, path, hints)?.fb;
 

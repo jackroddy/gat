@@ -16,6 +16,14 @@ mod svg;
 pub struct Hints {
     pub max_w: u32,
     pub max_h: u32,
+
+    /// The terminal's character cell.
+    //
+    // a flowed source sets its type from this: a monospace
+    // glyph advances by exactly one cell width, so matching the
+    // cell is what makes the body text come out the size of the
+    // text around it
+    pub cell: crate::geometry::CellSize,
 }
 
 /// A decoded source.

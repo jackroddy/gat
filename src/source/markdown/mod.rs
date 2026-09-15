@@ -11,10 +11,16 @@ mod to_svg;
 use resvg::usvg;
 
 use crate::framebuffer::Framebuffer;
+use crate::geometry::CellSize;
 use crate::source::{Error, Hints, Loaded, svg};
 
 /// The column count a page is laid out to, whatever pixel width
 /// the caller asks for.
+//
+// the page is no wider than this however wide the terminal is.
+// a line of prose running the full width of a large window is
+// hard to read, and the empty right-hand side costs nothing
+// since the page is only as wide as the text it holds
 const TARGET_COLS: f32 = 88.0;
 
 /// Lower bound on the derived font size, in pixels.
@@ -33,14 +39,19 @@ const MAX_PIXELS: u32 = 16_000_000;
 pub fn load(bytes: &[u8], hints: Hints) -> Result<Loaded, Error> {
     let text = String::from_utf8_lossy(bytes);
 
-    let width = hints.max_w.max(1) as f32;
-    let theme = theme_for(width);
+    let theme = theme_for(hints.cell);
+
+    // only as wide as the measure needs, so the page is no
+    // larger than the text in it
+    let measure = TARGET_COLS * theme.base_size * font::ADVANCE_RATIO + 2.0 * theme.margin;
+    let width = measure.min(hints.max_w.max(1) as f32).max(1.0);
+
     let page = layout::layout(&parse::parse(&text), &theme, width);
 
     // the whole document is drawn, not a screenful: the
     // viewer scrolls by cropping this buffer, and cropping
     // costs a memcpy where drawing again costs a rasterize
-    let total_h = drawn_height(page.h, hints);
+    let total_h = drawn_height(page.h, width, hints);
 
     let svg_doc = to_svg::emit(&page, theme.bg, 0.0, total_h);
     let tree = usvg::Tree::from_str(&svg_doc, &font::options())
@@ -53,29 +64,32 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Loaded, Error> {
 }
 
 /// The theme to lay out with, sized for the width the caller asked for.
-fn theme_for(width: f32) -> layout::Theme {
+fn theme_for(cell: CellSize) -> layout::Theme {
     let base = layout::Theme::DARK;
-    let usable = (width - 2.0 * base.margin).max(1.0);
 
-    // derived from a column target rather than fixed in pixels:
-    // tui.rs asks for a wider page than main.rs, and one fixed
-    // size would wrap the two at different column counts
-    let size = (usable / (TARGET_COLS * font::ADVANCE_RATIO)).clamp(MIN_SIZE, MAX_SIZE);
+    // a monospace glyph advances by size * ADVANCE_RATIO, and a
+    // cell is exactly one advance wide, so this sets the body
+    // text to the width of the terminal's own characters
+    let size = (cell.w as f32 / font::ADVANCE_RATIO).clamp(MIN_SIZE, MAX_SIZE);
+
     layout::Theme {
         base_size: size,
+        // one text line to one terminal row, so the page lines
+        // up with whatever else is on screen
+        line_ratio: (cell.h as f32 / size).max(1.0),
         margin: base.margin.max(size * 0.75),
         ..base
     }
 }
 
 /// How tall a page to draw, given how tall the content is.
-fn drawn_height(content_h: f32, hints: Hints) -> f32 {
+fn drawn_height(content_h: f32, width: f32, hints: Hints) -> f32 {
     // the one-shot render asks for a screenful and gets one,
     // since geometry::fit would otherwise shrink a long page
     // until the text lost resolution. the viewer asks for the
     // document and crops it as the reader scrolls
     let by_request = hints.max_h.max(1) as f32;
-    let by_memory = (MAX_PIXELS / hints.max_w.max(1)) as f32;
+    let by_memory = MAX_PIXELS as f32 / width.max(1.0);
     content_h.min(by_request).min(by_memory).max(1.0)
 }
 
@@ -100,22 +114,28 @@ mod tests {
         Hints {
             max_w: w,
             max_h: h,
+            cell: CellSize { w: 14, h: 32 },
         }
     }
 
     #[test]
     fn a_page_is_drawn_to_the_height_asked_for() {
         // the one-shot render gets a screenful
-        assert_eq!(drawn_height(6000.0, hints(800, 600)), 600.0);
-        assert_eq!(drawn_height(200.0, hints(800, 600)), 200.0);
+        assert_eq!(drawn_height(6000.0, 800.0, hints(800, 600)), 600.0);
+        assert_eq!(drawn_height(200.0, 800.0, hints(800, 600)), 200.0);
         // the viewer asks for the document and gets all of it
-        assert_eq!(drawn_height(6000.0, hints(800, u32::MAX)), 6000.0);
+        assert_eq!(drawn_height(6000.0, 800.0, hints(800, u32::MAX)), 6000.0);
     }
 
     #[test]
     fn the_pixel_ceiling_overrides_a_generous_caller() {
-        let h = drawn_height(f32::MAX, hints(8000, 100_000));
-        assert_eq!(h, (MAX_PIXELS / 8000) as f32);
+        // the ceiling is on pixels, so it buys fewer rows the
+        // wider the page is
+        let wide = drawn_height(f32::MAX, 8000.0, hints(8000, 100_000));
+        assert_eq!(wide, MAX_PIXELS as f32 / 8000.0);
+
+        let narrow = drawn_height(f32::MAX, 800.0, hints(8000, 100_000));
+        assert!(narrow > wide, "a narrower page should fit more rows");
     }
 
     #[test]
@@ -155,7 +175,7 @@ mod bench {
     fn where_does_the_time_go() {
         let bytes = std::fs::read("CLAUDE.md").unwrap();
         let text = String::from_utf8_lossy(&bytes);
-        let theme = theme_for(2000.0);
+        let theme = theme_for(CellSize { w: 14, h: 32 });
 
         let t = std::time::Instant::now();
         for _ in 0..20 {
