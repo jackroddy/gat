@@ -2,6 +2,10 @@
 name = "gat"
 version = "0.1.0"
 edition = "2024"
+authors = ["Jack Roddy <jack.w.roddy@gmail.com>"]
+repository = "https://github.com/jackroddy/gat"
+license = "MIT OR Apache-2.0"
+description = "graphics at terminal"
 
 [dependencies]
 lexopt = "0.3"
@@ -22,12 +26,6 @@ jpeg = ["image/jpeg"]
 svg = ["dep:resvg", "resvg/text"]
 pdf = ["dep:hayro"]
 pdf-pdfium = ["dep:pdfium-render"]
-# markdown rasterizes through resvg, so it turns on the svg feature wholesale
-# rather than reaching for resvg directly: the extra .svg file support that
-# comes with it is harmless, and it keeps the cfg gating to one name.
-#
-# both are in `default`, so these names exist to be switched off with
-# --no-default-features rather than to be switched on
 markdown = ["dep:pulldown-cmark", "dep:unicode-width", "svg"]
 
 [profile.release]
