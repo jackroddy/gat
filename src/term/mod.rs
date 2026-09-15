@@ -268,7 +268,7 @@ pub fn height_ladder(width: u32, view_h: u32) -> String {
     };
     let budget = Duration::from_millis(400);
 
-    for (n, h) in [1000u32, 2000, 4000, 6000, 8192, 8193, 12000]
+    for (n, h) in [8192u32, 8500, 9000, 9500, 10000, 11000, 12000]
         .into_iter()
         .enumerate()
     {

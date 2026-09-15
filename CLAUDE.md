@@ -91,40 +91,36 @@ it is given, so its font size is derived from the width asked for rather than
 fixed. Scaling a long page down is never the answer: `geometry::fit` shrinks by
 the tighter axis, which would reduce a document until the text was unreadable.
 
-A document is therefore drawn a band at a time, which is what `Hints.from_y`
-is for. The one-shot render asks for the top and nothing else. The viewer asks
-for the band around what the reader can see, fits it on width alone, and asks
-again with a new `from_y` when scrolling nears the edge of it.
+The whole document is rasterized once, into memory, and the viewer transmits
+that page to the terminal a single time. Scrolling then sends a new source
+rectangle for the image the terminal already holds, which costs 69 bytes.
+Thirty scrolls send no transmits at all and about 4.7KB.
 
-The reason is not memory here but what a terminal will accept. It stores the
-image, and a whole document is tens of megabytes as one texture — 63M for this
-file in a large window — which a terminal may simply refuse. So keep a band
-close to the size the one-shot path produces, since that is the size known to
-work. Laying the document out to find the band costs nothing worth counting:
-parse, layout and SVG emit together are about 270µs, against 61ms to rasterize
-and 23ms to compress. Only the drawing scales with what is on screen, which is
-the whole point.
+Do not go back to drawing a screenful at a time. It was tried, and cutting a
+new image whenever the view left the last one is what made scrolling drag: each
+cut makes the terminal load an image and upload a texture, which is expensive
+however cheap our side of the cut becomes. Measured against a terminal doing
+real work, twenty-five scrolls that way asked it to load over 200MB.
 
-For the same reason the viewer gives a document no `ZOOM_HEADROOM`. Headroom
-buys real pixels to zoom into, which a photo has and a document does not: ask
-markdown for double the width and it returns the same words at double the size,
-to be drawn at half. That is four times the pixels for an identical-looking
-page.
+Measure what the terminal is asked to do, not what rimg spends. A harness that
+reads the escapes and discards them will report a keypress answered in zero
+milliseconds while the terminal behind it is loading megabytes per frame. That
+mistake cost a day.
 
-No terminal advertises what it will hold, so do not guess it. Transmit with
-`q=1` so refusals come back instead of vanishing, and halve the band when one
-does. Starting generous and backing off beats picking a number that suits the
-stingiest terminal.
+The viewer gives a document no `ZOOM_HEADROOM`. Headroom buys real pixels to
+zoom into, which a photo has and a document does not: ask markdown for double
+the width and it returns the same words at double the size, to be drawn at
+half. That is four times the pixels for an identical-looking page.
+
+Transmit with `q=1` so a refusal comes back instead of vanishing, and put what
+comes back in the status line. That is how `EINVAL: unsupported medium` was
+found. `q=2` suppresses failures along with successes, which turns a refused
+image into a blank screen with nothing to explain it.
 
 The viewer never re-encodes pixels. It transmits once, then pans and zooms by
 sending a new source rectangle for the stored image, which the terminal scales.
 A frame costs 69 bytes. Re-encoding instead measured 40-90ms and several
 megabytes per frame, so think hard before moving redrawing back into Rust.
-
-Documents are the one exception, and only because the alternative does not
-work: a whole document is too large for a terminal to store. Even there most
-frames are still the 69-byte kind, because a band holds more than the screen
-shows and only running off the end of one costs a re-render.
 
 Reuse one placement id and let the new placement replace the old one. Delete
 the old one first and the background shows through the gap, which reads as a
@@ -166,6 +162,36 @@ multiplexer swallowing the sequences. `SSH_TTY` decides how long a reply may
 take before detection gives up. The same latency splits a keypress across two
 reads, so the viewer holds back a trailing escape instead of reading it as the
 escape key and quitting on the first arrow press.
+
+## Multiplexers
+
+The viewer draws correctly in raw Ghostty and shows a blank screen under herdr
+and under tmux. `--print` works everywhere. Whatever is wrong is in the
+interactive path and only under a multiplexer, and it is unresolved.
+
+Do not trust what a multiplexer says about itself. herdr answers `a=q` for the
+file transport (`t=f`) with `OK`, and then refuses every real transmission with
+`EINVAL: unsupported medium`. A query is not evidence of anything; only a real
+transmission is. An afternoon went into a feature built on that `OK`.
+
+It also fails silently. Storing an oversized image produces no error, and the
+refusal surfaces only as `ENOENT: image not found` when the placement arrives.
+So a design that shrinks an image when the terminal complains cannot work here,
+because nothing complains.
+
+Measured under herdr on the normal screen, at 1904 pixels wide: images up to
+10000 pixel rows store and place, 11000 does not. The viewer's page is 8403
+rows, which is under that, so the page being too large is **not** the
+explanation. What has not been tested is the alternate screen, which the viewer
+uses and the ladder does not. In its favour: the builds that sent 5 megapixels
+drew and the ones that sent 16 did not, and neither figure matches the 19 the
+ladder accepts outside the alternate screen. The next test is that same ladder
+wrapped in `\x1b[?1049h`.
+
+`rimg --probe` carries the ladder. It stores and places an image at a range of
+heights the way the viewer does and prints what came back, reading the replies
+through a `Probe`. An earlier version left them on the tty, the shell took most
+of them, and a size limit was read out of the one answer that survived.
 
 ## Testing
 
