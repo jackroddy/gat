@@ -1,4 +1,4 @@
-# rimg
+# gat
 
 A small terminal viewer in Rust, modeled on
 [timg](https://github.com/hzeller/timg). It handles the Kitty graphics protocol,
@@ -102,7 +102,7 @@ cut makes the terminal load an image and upload a texture, which is expensive
 however cheap our side of the cut becomes. Measured against a terminal doing
 real work, twenty-five scrolls that way asked it to load over 200MB.
 
-Measure what the terminal is asked to do, not what rimg spends. A harness that
+Measure what the terminal is asked to do, not what gat spends. A harness that
 reads the escapes and discards them will report a keypress answered in zero
 milliseconds while the terminal behind it is loading megabytes per frame. That
 mistake cost a day.
@@ -188,7 +188,7 @@ drew and the ones that sent 16 did not, and neither figure matches the 19 the
 ladder accepts outside the alternate screen. The next test is that same ladder
 wrapped in `\x1b[?1049h`.
 
-`rimg --probe` carries the ladder. It stores and places an image at a range of
+`gat --probe` carries the ladder. It stores and places an image at a range of
 heights the way the viewer does and prints what came back, reading the replies
 through a `Probe`. An earlier version left them on the tty, the shell took most
 of them, and a size limit was read out of the one answer that survived.

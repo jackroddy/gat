@@ -335,6 +335,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gat"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "flate2",
+ "hayro",
+ "image",
+ "lexopt",
+ "pdfium-render",
+ "pulldown-cmark",
+ "resvg",
+ "rustix",
+ "unicode-width",
+]
+
+[[package]]
 name = "glifo"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -854,22 +870,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "rimg"
-version = "0.1.0"
-dependencies = [
- "base64",
- "flate2",
- "hayro",
- "image",
- "lexopt",
- "pdfium-render",
- "pulldown-cmark",
- "resvg",
- "rustix",
- "unicode-width",
 ]
 
 [[package]]

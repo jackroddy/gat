@@ -28,7 +28,7 @@ fn main() -> ExitCode {
         Ok(Some(args)) => args,
         Ok(None) => return ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("rimg: {e}");
+            eprintln!("gat: {e}");
             return ExitCode::from(2);
         }
     };
@@ -36,7 +36,7 @@ fn main() -> ExitCode {
     let terminal = term::Terminal::detect();
     if terminal.protocol != Protocol::Kitty && !args.force {
         eprintln!(
-            "rimg: this terminal does not support the kitty graphics protocol \
+            "gat: this terminal does not support the kitty graphics protocol \
              (--probe says what detection saw, --force-kitty overrides)"
         );
         return ExitCode::from(1);
@@ -60,7 +60,7 @@ fn main() -> ExitCode {
     let interactive = !args.print && rustix::termios::isatty(rustix::stdio::stdout());
     if interactive {
         if let Err(e) = tui::run(&args.files, terminal, args.background) {
-            eprintln!("rimg: {e}");
+            eprintln!("gat: {e}");
             return ExitCode::FAILURE;
         }
         return ExitCode::SUCCESS;
@@ -72,7 +72,7 @@ fn main() -> ExitCode {
     for path in &args.files {
         if let Err(e) = show(&mut out, path, &budget, args.background) {
             let _ = out.flush();
-            eprintln!("rimg: {}: {e}", path.display());
+            eprintln!("gat: {}: {e}", path.display());
             failed = true;
         }
     }
@@ -181,7 +181,7 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
                 return Ok(None);
             }
             Short('V') | Long("version") => {
-                println!("rimg {}", env!("CARGO_PKG_VERSION"));
+                println!("gat {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             Value(v) => args.files.push(PathBuf::from(v)),
@@ -210,7 +210,7 @@ fn parse_color(s: &str) -> Result<[u8; 3], lexopt::Error> {
 }
 
 const HELP: &str = "\
-usage: rimg [options] <file>...
+usage: gat [options] <file>...
 
   -g, --geometry WxH   fit within W columns by H rows
   -U, --upscale        enlarge images smaller than the available space
