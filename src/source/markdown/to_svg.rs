@@ -10,8 +10,13 @@ use std::fmt::Write;
 use super::font;
 use super::layout::{Item, Page, Rgb};
 
-/// Render `page` as an SVG document.
-pub fn emit(page: &Page, bg: Rgb) -> String {
+/// Render the slice of `page` from `from_y` for `h` pixels.
+//
+// only the items that fall in the band are emitted, and the band is drawn at
+// the origin. that keeps both the SVG parse and the rasterize proportional to
+// what is on screen rather than to the length of the document, which is the
+// whole point of drawing a band at a time.
+pub fn emit(page: &Page, bg: Rgb, from_y: f32, h: f32) -> String {
     let mut s = String::with_capacity(page.items.len() * 96 + 512);
 
     // xml:space, because usvg implements SVG's whitespace collapsing and would
@@ -24,14 +29,18 @@ pub fn emit(page: &Page, bg: Rgb) -> String {
         "<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}' \
          viewBox='0 0 {w} {h}' xml:space='preserve'>\
          <rect width='100%' height='100%' fill='{bg}'/>\
-         <g font-family='{family}' font-kerning='none'>",
+         <g font-family='{family}' font-kerning='none' \
+         transform='translate(0,{shift})'>",
         w = page.w,
-        h = page.h,
         bg = hex(bg),
         family = font::FAMILY,
+        shift = -from_y,
     );
 
     for item in &page.items {
+        if !visible(item, from_y, h) {
+            continue;
+        }
         match item {
             Item::Rect { x, y, w, h, fill } => {
                 let _ = write!(
@@ -67,6 +76,20 @@ pub fn emit(page: &Page, bg: Rgb) -> String {
 
     s.push_str("</g></svg>");
     s
+}
+
+/// Whether `item` puts any ink inside the band starting at `from_y`.
+//
+// a run is positioned by its baseline, so its ink reaches roughly one em above
+// and a third below. Being generous here costs one clipped glyph's worth of
+// work and avoids the opposite mistake, which is a line vanishing from the top
+// or bottom edge of every band.
+fn visible(item: &Item, from_y: f32, h: f32) -> bool {
+    let (top, bottom) = match item {
+        Item::Rect { y, h, .. } => (*y, y + h),
+        Item::Run { baseline, size, .. } => (baseline - size * 1.2, baseline + size * 0.4),
+    };
+    bottom >= from_y && top <= from_y + h
 }
 
 fn hex(c: Rgb) -> String {

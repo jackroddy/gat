@@ -32,6 +32,25 @@ const CONTINUATION_SSH: Duration = Duration::from_millis(200);
 /// real pixels to enlarge rather than a blur.
 const ZOOM_HEADROOM: u32 = 2;
 
+/// How much document to render around what is on screen, as a multiple of the
+/// viewport height.
+//
+// the ceiling on this is not memory here but what a terminal will accept: it
+// stores the image, and handing it a whole document means tens of megabytes as
+// one texture, which it may refuse outright. The band therefore stays close to
+// the size the one-shot path produces, which is the size known to work.
+// Everything above one viewport is margin, bought so that ordinary scrolling
+// moves inside the band and costs a placement rather than a re-render.
+const BAND: f32 = 1.6;
+
+/// How far the band will shrink when a terminal says no.
+//
+// terminals differ in what they will hold and none of them advertises it, so
+// rather than guess a number that suits the stingiest, start generous and back
+// off when refused. The floor stops a terminal that refuses everything from
+// driving this to nothing and re-rendering forever.
+const BAND_FLOOR: f32 = 0.35;
+
 const MAX_ZOOM: f64 = 32.0;
 const MIN_ZOOM: f64 = 1.0;
 
@@ -70,9 +89,14 @@ impl Drop for Screen {
 }
 
 struct Shown {
+    /// The pixels on hand. For a document this is one band of it, not all.
     image: Framebuffer,
     id: u32,
     kind: source::Kind,
+    /// Where `image` starts in the document, and how tall the document is.
+    /// For an image, 0 and its own height.
+    band_y: u32,
+    doc_h: u32,
 }
 
 /// Which part of the image the viewer is looking at.
@@ -86,19 +110,18 @@ struct View {
 }
 
 impl View {
-    fn reset(image: &Framebuffer, kind: source::Kind, cells: (u32, u32), cell: CellSize) -> View {
+    fn reset(shown: &Shown, cells: (u32, u32), cell: CellSize) -> View {
         let mut view = View {
             zoom: 1.0,
-            cx: image.width() as f64 / 2.0,
-            cy: image.height() as f64 / 2.0,
+            cx: shown.image.width() as f64 / 2.0,
+            cy: shown.doc_h as f64 / 2.0,
         };
         // a picture opens centred, because the middle is where the subject is.
         // a document opens at the top, because that is where the reading
         // starts, and centring a long one would drop the reader into the
         // middle of it
-        if kind == source::Kind::Document {
-            let p = placement(image, kind, &view, cells, cell);
-            view.cy = p.src_h as f64 / 2.0;
+        if shown.kind == source::Kind::Document {
+            view.cy = geom(shown, &view, cells, cell).src_h / 2.0;
         }
         view
     }
@@ -165,6 +188,11 @@ fn event_loop(
         cy: 0.0,
     };
     let mut load_wanted = true;
+    // shrunk on refusal; see BAND_FLOOR
+    let mut band = BAND;
+    // where in the document the next render should start; always 0 for an
+    // image, and for a document the top of the band the view needs
+    let mut wanted_y = 0u32;
     let mut dirty = true;
     let mut loading: Option<Loading> = None;
 
@@ -175,7 +203,14 @@ fn event_loop(
             // replacing the job drops the old receiver, so a worker the user
             // has already navigated away from finds nobody to send to and its
             // result never lands
-            loading = Some(spawn_load(files[index].clone(), cells, cell, background));
+            loading = Some(spawn_load(
+                files[index].clone(),
+                cells,
+                cell,
+                background,
+                wanted_y,
+                band,
+            ));
         }
 
         if let Some(job) = &loading {
@@ -189,7 +224,11 @@ fn event_loop(
                         }) => {
                             fresh.id = kitty::next_id();
                             kitty::emit(out, &encoded, fresh.id, false, kitty::Quiet::ErrorsOnly)?;
-                            view = View::reset(&fresh.image, fresh.kind, cells, cell);
+                            // a band fetched because the reader scrolled must
+                            // not throw away where they scrolled to
+                            if fresh.band_y == 0 && shown.is_none() {
+                                view = View::reset(&fresh, cells, cell);
+                            }
                             // place the new image before dropping the old one,
                             // so the screen never shows the gap between them
                             let previous = shown.replace(fresh);
@@ -218,6 +257,17 @@ fn event_loop(
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+
+        // a view that has walked past the rendered pixels needs more of them.
+        // only ask when nothing is already on the way, or a fast scroll would
+        // queue a request per keypress
+        if loading.is_none()
+            && let Some(s) = &shown
+            && let Some(want) = needed_band(s, &view, cells, cell)
+        {
+            wanted_y = want;
+            load_wanted = true;
         }
 
         if dirty {
@@ -253,7 +303,17 @@ fn event_loop(
         // along with the acknowledgements, which is how a refusal turned into
         // a blank screen and no explanation
         if let Some(complaint) = graphics_error(&input) {
-            failure = Some(complaint);
+            // a refusal is usually about size, and size is the one thing we
+            // can do something about: ask for less and try again, rather than
+            // leaving the reader with an empty screen and an error
+            if band > BAND_FLOOR && shown.as_ref().is_some_and(|s| s.kind == source::Kind::Document)
+            {
+                band = (band * 0.5).max(BAND_FLOOR);
+                load_wanted = true;
+                failure = Some(format!("{complaint}; retrying with a smaller page"));
+            } else {
+                failure = Some(complaint);
+            }
             dirty = true;
         }
 
@@ -262,16 +322,18 @@ fn event_loop(
                 Key::Quit => return Ok(()),
                 Key::Next if index + 1 < files.len() => {
                     index += 1;
+                    wanted_y = 0;
                     load_wanted = true;
                 }
                 Key::Prev if index > 0 => {
                     index -= 1;
+                    wanted_y = 0;
                     load_wanted = true;
                 }
                 Key::Next | Key::Prev => {}
                 Key::Reset => {
                     if let Some(s) = &shown {
-                        view = View::reset(&s.image, s.kind, cells, cell);
+                        view = View::reset(s, cells, cell);
                     }
                     dirty = true;
                 }
@@ -281,9 +343,13 @@ fn event_loop(
                 }
                 Key::Pan(dx, dy) => {
                     if let Some(s) = &shown {
-                        let p = placement(&s.image, s.kind, &view, cells, cell);
-                        view.cx += dx * p.src_w as f64;
-                        view.cy += dy * p.src_h as f64;
+                        let g = geom(s, &view, cells, cell);
+                        view.cx += dx * g.src_w;
+                        // clamped against the document, not the band, so a
+                        // scroll can walk off the rendered pixels and ask for
+                        // the next ones rather than stopping at the seam
+                        view.cy = (view.cy + dy * g.src_h)
+                            .clamp(g.src_h / 2.0, (g.doc_h - g.src_h / 2.0).max(g.src_h / 2.0));
                     }
                     dirty = true;
                 }
@@ -297,14 +363,67 @@ fn event_loop(
 // the terminal does the scaling: the source rectangle is clipped to the image
 // and then stretched to fill the cell box, so panning and zooming cost one
 // escape sequence each and never re-encode a pixel
-fn placement(
-    image: &Framebuffer,
-    kind: source::Kind,
-    view: &View,
-    cells: (u32, u32),
-    cell: CellSize,
-) -> Placement {
-    let (img_w, img_h) = (image.width() as f64, image.height() as f64);
+fn placement(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Placement {
+    let g = geom(s, view, cells, cell);
+    Placement {
+        src_x: (view.cx - g.src_w / 2.0).clamp(0.0, (g.img_w - g.src_w).max(0.0)) as u32,
+        // the view is tracked in document pixels, but the pixels on hand are
+        // one band of it, so the source rectangle is measured from the band
+        src_y: (g.doc_top - s.band_y as f64).clamp(0.0, (g.band_h - g.src_h).max(0.0)) as u32,
+        src_w: g.src_w as u32,
+        src_h: g.src_h as u32,
+        cols: ((g.shown_w / cell.w as f64).ceil() as u32).clamp(1, cells.0.max(1)),
+        rows: ((g.shown_h / cell.h as f64).ceil() as u32)
+            .clamp(1, cells.1.saturating_sub(1).max(1)),
+    }
+}
+
+/// The band this view needs, when the one on hand does not reach it.
+//
+// scrolling walks the view down the document while the band stays put, so
+// sooner or later the window runs off the end of what was rendered. Asking
+// early, while there is still a margin of band left, means the new pixels
+// usually arrive before the reader gets to the part they cover.
+fn needed_band(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Option<u32> {
+    if s.kind != source::Kind::Document {
+        return None;
+    }
+    let g = geom(s, view, cells, cell);
+    let band_y = s.band_y as f64;
+    let slack = ((g.band_h - g.src_h) / 2.0).max(0.0);
+    // ask when less than a quarter of the margin is left, not when it runs out
+    let trigger = slack * 0.25;
+
+    let above = g.doc_top - band_y;
+    let below = (band_y + g.band_h) - (g.doc_top + g.src_h);
+    let wanting = (above < trigger && s.band_y > 0)
+        || (below < trigger && (band_y + g.band_h) < g.doc_h - 0.5);
+    if !wanting {
+        return None;
+    }
+
+    // centre the new band on where the reader is
+    let want = (g.doc_top - slack).clamp(0.0, (g.doc_h - g.band_h).max(0.0)) as u32;
+    (want != s.band_y).then_some(want)
+}
+
+/// The shared arithmetic behind placing a band and deciding to fetch another.
+struct Geom {
+    img_w: f64,
+    band_h: f64,
+    doc_h: f64,
+    shown_w: f64,
+    shown_h: f64,
+    src_w: f64,
+    src_h: f64,
+    /// Top of the visible window, in document pixels.
+    doc_top: f64,
+}
+
+fn geom(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Geom {
+    let img_w = s.image.width().max(1) as f64;
+    let band_h = s.image.height().max(1) as f64;
+    let doc_h = s.doc_h.max(1) as f64;
     let (cols, rows) = (cells.0.max(1), cells.1.saturating_sub(1).max(1));
     let view_w = (cols * cell.w) as f64;
     let view_h = (rows * cell.h) as f64;
@@ -316,24 +435,27 @@ fn placement(
     // a long page until the text was unreadable, and would leave nothing to
     // pan to, because the whole thing would already be on screen. width-only
     // is what every pager does: full size, and scroll to read on
-    let base = match kind {
+    let base = match s.kind {
         source::Kind::Document => (view_w / img_w).min(1.0),
-        source::Kind::Image => (view_w / img_w).min(view_h / img_h).min(1.0),
+        source::Kind::Image => (view_w / img_w).min(view_h / doc_h).min(1.0),
     };
-    let scale = base * view.zoom;
+    let scale = (base * view.zoom).max(f64::MIN_POSITIVE);
 
     let shown_w = (img_w * scale).min(view_w);
-    let shown_h = (img_h * scale).min(view_h);
+    let shown_h = (doc_h * scale).min(view_h);
     let src_w = (shown_w / scale).round().clamp(1.0, img_w);
-    let src_h = (shown_h / scale).round().clamp(1.0, img_h);
+    let src_h = (shown_h / scale).round().clamp(1.0, band_h);
+    let doc_top = (view.cy - src_h / 2.0).clamp(0.0, (doc_h - src_h).max(0.0));
 
-    Placement {
-        src_x: (view.cx - src_w / 2.0).clamp(0.0, (img_w - src_w).max(0.0)) as u32,
-        src_y: (view.cy - src_h / 2.0).clamp(0.0, (img_h - src_h).max(0.0)) as u32,
-        src_w: src_w as u32,
-        src_h: src_h as u32,
-        cols: ((shown_w / cell.w as f64).ceil() as u32).clamp(1, cols),
-        rows: ((shown_h / cell.h as f64).ceil() as u32).clamp(1, rows),
+    Geom {
+        img_w,
+        band_h,
+        doc_h,
+        shown_w,
+        shown_h,
+        src_w,
+        src_h,
+        doc_top,
     }
 }
 
@@ -353,7 +475,7 @@ fn draw(
     out.write_all(b"\x1b[H\x1b[J")?;
 
     if let Some(s) = shown {
-        kitty::place(out, s.id, &placement(&s.image, s.kind, view, cells, cell))?;
+        kitty::place(out, s.id, &placement(s, view, cells, cell))?;
     }
 
     let name = files[index]
@@ -377,6 +499,8 @@ fn load(
     cells: (u32, u32),
     cell: CellSize,
     background: [u8; 3],
+    from_y: u32,
+    band: f32,
 ) -> Result<Shown, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
     let kind = source::kind(&bytes, path);
@@ -394,12 +518,14 @@ fn load(
     };
     let hints = source::Hints {
         max_w: cells.0 * cell.w * headroom,
-        max_h: cells.1 * cell.h * headroom,
-        // the viewer pans over what it is given, so a flowed source should
-        // hand over the whole document rather than one screen of it
-        overflow: source::Overflow::Keep,
+        max_h: match kind {
+            // a band, not the document: see BAND
+            source::Kind::Document => (cells.1 as f32 * cell.h as f32 * band).max(1.0) as u32,
+            source::Kind::Image => cells.1 * cell.h * headroom,
+        },
+        from_y,
     };
-    let decoded = source::load(&bytes, path, hints)?;
+    let source::Loaded { fb: decoded, total_h } = source::load(&bytes, path, hints)?;
 
     // transmitting the full source of a large photo would burn the terminal's
     // image quota for detail no zoom level reaches. a document is exempt: its
@@ -426,6 +552,8 @@ fn load(
         image: fb,
         id: 0,
         kind,
+        band_y: from_y,
+        doc_h: total_h,
     })
 }
 
@@ -441,10 +569,12 @@ fn spawn_load(
     cells: (u32, u32),
     cell: CellSize,
     background: [u8; 3],
+    from_y: u32,
+    band: f32,
 ) -> Loading {
     let (tx, done) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = load(&path, cells, cell, background)
+        let result = load(&path, cells, cell, background, from_y, band)
             .map_err(|e| e.to_string())
             .and_then(|shown| {
                 kitty::encode(&shown.image)
@@ -662,6 +792,16 @@ mod tests {
         assert!(PATIENCE < Duration::from_millis(500));
     }
 
+    fn shown(image: Framebuffer, kind: source::Kind, band_y: u32, doc_h: u32) -> Shown {
+        Shown {
+            image,
+            id: 1,
+            kind,
+            band_y,
+            doc_h,
+        }
+    }
+
     #[test]
     fn a_document_is_fitted_on_width_and_scrolls() {
         // a picture wants to be seen whole, so it is fitted on both axes and
@@ -670,13 +810,13 @@ mod tests {
         let page = Framebuffer::new(900, 6000);
         let v = view(1.0, 450.0, 200.0);
 
-        let doc = placement(&page, source::Kind::Document, &v, (100, 30), CELL);
+        let doc = placement(&shown(page.clone(), source::Kind::Document, 0, 6000), &v, (100, 30), CELL);
         assert!(
             doc.src_h < 6000,
             "a document showed its whole height at rest, so there is no scroll"
         );
 
-        let pic = placement(&page, source::Kind::Image, &v, (100, 30), CELL);
+        let pic = placement(&shown(page.clone(), source::Kind::Image, 0, 6000), &v, (100, 30), CELL);
         assert_eq!(pic.src_h, 6000, "a picture should still be fitted whole");
         assert!(
             doc.src_h < pic.src_h,
@@ -685,18 +825,60 @@ mod tests {
     }
 
     #[test]
+    fn the_band_on_hand_is_enough_until_the_view_nears_its_edge() {
+        // 6000px document, a band covering the top 1000
+        let s = shown(Framebuffer::new(900, 1000), source::Kind::Document, 0, 6000);
+        let cells = (100, 30);
+
+        // at the very top, nothing more is wanted
+        let top = View::reset(&s, cells, CELL);
+        assert_eq!(needed_band(&s, &top, cells, CELL), None);
+
+        // scrolled to the bottom of the band, the next one is due
+        let g = geom(&s, &top, cells, CELL);
+        let edge = View {
+            cy: 1000.0 - g.src_h / 2.0,
+            ..top
+        };
+        let want = needed_band(&s, &edge, cells, CELL).expect("no band requested at the edge");
+        assert!(want > 0, "the new band should start further down");
+    }
+
+    #[test]
+    fn a_picture_never_asks_for_another_band() {
+        // bands are a markdown idea; an image is all there at once
+        let s = shown(Framebuffer::new(900, 6000), source::Kind::Image, 0, 6000);
+        let v = View::reset(&s, (100, 30), CELL);
+        assert_eq!(needed_band(&s, &v, (100, 30), CELL), None);
+    }
+
+    #[test]
+    fn the_last_band_of_a_document_asks_for_nothing_more() {
+        // a band that reaches the end must not keep requesting itself, which
+        // would re-render forever at the bottom of every document
+        let s = shown(Framebuffer::new(900, 1000), source::Kind::Document, 5000, 6000);
+        let bottom = View {
+            zoom: 1.0,
+            cx: 450.0,
+            cy: 6000.0,
+        };
+        assert_eq!(needed_band(&s, &bottom, (100, 30), CELL), None);
+    }
+
+    #[test]
     fn a_document_opens_at_its_first_line() {
         // centring a long document drops the reader into the middle of it
         let page = Framebuffer::new(900, 6000);
-        let v = View::reset(&page, source::Kind::Document, (100, 30), CELL);
-        let p = placement(&page, source::Kind::Document, &v, (100, 30), CELL);
+        let s = shown(page, source::Kind::Document, 0, 6000);
+        let v = View::reset(&s, (100, 30), CELL);
+        let p = placement(&s, &v, (100, 30), CELL);
         assert_eq!(p.src_y, 0, "document did not open at the top");
     }
 
     #[test]
     fn unzoomed_shows_the_whole_image() {
         let img = image(1000, 500);
-        let p = placement(&img, source::Kind::Image, &view(1.0, 500.0, 250.0), (80, 25), CELL);
+        let p = placement(&shown(img.clone(), source::Kind::Image, 0, img.height()), &view(1.0, 500.0, 250.0), (80, 25), CELL);
         assert_eq!((p.src_x, p.src_y), (0, 0));
         assert_eq!((p.src_w, p.src_h), (1000, 500));
     }
@@ -704,8 +886,8 @@ mod tests {
     #[test]
     fn zooming_in_shrinks_the_source_rectangle() {
         let img = image(1000, 500);
-        let wide = placement(&img, source::Kind::Image, &view(1.0, 500.0, 250.0), (80, 25), CELL);
-        let close = placement(&img, source::Kind::Image, &view(2.0, 500.0, 250.0), (80, 25), CELL);
+        let wide = placement(&shown(img.clone(), source::Kind::Image, 0, img.height()), &view(1.0, 500.0, 250.0), (80, 25), CELL);
+        let close = placement(&shown(img.clone(), source::Kind::Image, 0, img.height()), &view(2.0, 500.0, 250.0), (80, 25), CELL);
         assert!(close.src_w < wide.src_w && close.src_h < wide.src_h);
         // the axis that was already filling the viewport halves exactly; the
         // letterboxed axis shows less than half, because zooming first eats
@@ -718,7 +900,7 @@ mod tests {
     fn the_source_rectangle_keeps_the_display_box_aspect_ratio() {
         let img = image(1000, 500);
         for zoom in [1.0, 1.5, 2.0, 8.0] {
-            let p = placement(&img, source::Kind::Image, &view(zoom, 500.0, 250.0), (80, 25), CELL);
+            let p = placement(&shown(img.clone(), source::Kind::Image, 0, img.height()), &view(zoom, 500.0, 250.0), (80, 25), CELL);
             let src = p.src_w as f64 / p.src_h as f64;
             let dst = (p.cols * CELL.w) as f64 / (p.rows * CELL.h) as f64;
             assert!(
@@ -732,7 +914,7 @@ mod tests {
     fn the_cell_box_never_exceeds_the_viewport() {
         let img = image(4000, 3000);
         for zoom in [1.0, 2.0, 8.0, 32.0] {
-            let p = placement(&img, source::Kind::Image, &view(zoom, 2000.0, 1500.0), (80, 25), CELL);
+            let p = placement(&shown(img.clone(), source::Kind::Image, 0, img.height()), &view(zoom, 2000.0, 1500.0), (80, 25), CELL);
             assert!(p.cols <= 80, "cols {} at zoom {zoom}", p.cols);
             // one row is held back for the status line
             assert!(p.rows <= 24, "rows {} at zoom {zoom}", p.rows);
@@ -742,10 +924,10 @@ mod tests {
     #[test]
     fn panning_past_an_edge_clamps_inside_the_image() {
         let img = image(1000, 500);
-        let p = placement(&img, source::Kind::Image, &view(4.0, -9000.0, -9000.0), (80, 25), CELL);
+        let p = placement(&shown(img.clone(), source::Kind::Image, 0, img.height()), &view(4.0, -9000.0, -9000.0), (80, 25), CELL);
         assert_eq!((p.src_x, p.src_y), (0, 0));
 
-        let q = placement(&img, source::Kind::Image, &view(4.0, 9000.0, 9000.0), (80, 25), CELL);
+        let q = placement(&shown(img.clone(), source::Kind::Image, 0, img.height()), &view(4.0, 9000.0, 9000.0), (80, 25), CELL);
         assert_eq!(q.src_x + q.src_w, 1000);
         assert_eq!(q.src_y + q.src_h, 500);
     }
@@ -753,7 +935,7 @@ mod tests {
     #[test]
     fn a_small_image_is_not_enlarged_at_rest() {
         let img = image(40, 30);
-        let p = placement(&img, source::Kind::Image, &view(1.0, 20.0, 15.0), (80, 25), CELL);
+        let p = placement(&shown(img.clone(), source::Kind::Image, 0, img.height()), &view(1.0, 20.0, 15.0), (80, 25), CELL);
         assert_eq!((p.src_w, p.src_h), (40, 30));
         assert_eq!((p.cols, p.rows), (4, 2));
     }

@@ -16,23 +16,24 @@ mod svg;
 pub struct Hints {
     pub max_w: u32,
     pub max_h: u32,
-    /// Only a flowed source can overflow, so only markdown reads this.
+    /// For a flowed source, how far down the document this slice starts.
+    //
+    // a document is drawn a band at a time rather than whole. Handing a
+    // terminal the entire thing means asking it to hold tens of megabytes as
+    // one image, which it may simply refuse, and the refusal looks exactly
+    // like the feature being broken. So the viewer asks for the part it can
+    // see and asks again when it scrolls off the end, and the one-shot render
+    // asks for the top and nothing else.
     #[cfg_attr(not(feature = "markdown"), allow(dead_code))]
-    pub overflow: Overflow,
+    pub from_y: u32,
 }
 
-/// What the caller can do with content taller than `max_h`.
-//
-// only a flowed source can be taller than it was asked for, so only markdown
-// reads this. the distinction matters because the two callers differ: the
-// one-shot render writes into the scrollback at the cursor and has nowhere to
-// put the rest, while the viewer transmits once and pans, so for it the
-// framebuffer *is* the scrollback and cutting the page to the screen would
-// throw away the part panning exists to reach
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Overflow {
-    Clip,
-    Keep,
+/// A decoded source, and how much more of it there is.
+pub struct Loaded {
+    pub fb: Framebuffer,
+    /// For a flowed source, the whole document's height, of which `fb` is one
+    /// band. For an image, simply its height.
+    pub total_h: u32,
 }
 
 /// Whether a source is a picture or a page of text.
@@ -76,19 +77,19 @@ pub fn kind(bytes: &[u8], path: &Path) -> Kind {
     }
 }
 
-pub fn load(bytes: &[u8], path: &Path, #[cfg_attr(not(any(feature = "svg", feature = "pdf", feature = "pdf-pdfium")), allow(unused))] hints: Hints) -> Result<Framebuffer, Error> {
+pub fn load(bytes: &[u8], path: &Path, #[cfg_attr(not(any(feature = "svg", feature = "pdf", feature = "pdf-pdfium")), allow(unused))] hints: Hints) -> Result<Loaded, Error> {
     match sniff(bytes, path) {
         Format::Raster => image::load_from_memory(bytes)
-            .map(|img| img.into_rgba8())
+            .map(|img| whole(img.into_rgba8()))
             .map_err(|e| Error::Decode(e.to_string())),
 
         #[cfg(feature = "svg")]
-        Format::Svg => svg::load(bytes, hints),
+        Format::Svg => svg::load(bytes, hints).map(whole),
         #[cfg(not(feature = "svg"))]
         Format::Svg => Err(Error::Unsupported("SVG (rebuild with --features svg)")),
 
         #[cfg(any(feature = "pdf", feature = "pdf-pdfium"))]
-        Format::Pdf => pdf::load(bytes, hints),
+        Format::Pdf => pdf::load(bytes, hints).map(whole),
         #[cfg(not(any(feature = "pdf", feature = "pdf-pdfium")))]
         Format::Pdf => Err(Error::Unsupported("PDF (rebuild with --features pdf)")),
 
@@ -146,6 +147,12 @@ fn sniff(bytes: &[u8], path: &Path) -> Format {
 /// Extensions that mean markdown. There is no sniffing to fall back on, so an
 /// unrecognized text file stays unknown rather than being read as markdown.
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd"];
+
+/// A source that is all there in one piece, which is every source but markdown.
+fn whole(fb: Framebuffer) -> Loaded {
+    let total_h = fb.height();
+    Loaded { fb, total_h }
+}
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)

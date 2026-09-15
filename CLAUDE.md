@@ -91,24 +91,40 @@ it is given, so its font size is derived from the width asked for rather than
 fixed. Scaling a long page down is never the answer: `geometry::fit` shrinks by
 the tighter axis, which would reduce a document until the text was unreadable.
 
-The two callers therefore want different things, which is what `Hints.overflow`
-is for. The one-shot render writes at the cursor and has nowhere to put the
-rest, so it clips to a screenful, the same bargain PDF makes by rendering only
-page one. The viewer transmits once and pans, so for it the framebuffer *is*
-the scrollback: it asks for the whole document, fits it on width alone, and
-scrolling is just panning. Clipping there would delete exactly the part panning
-exists to reach.
+A document is therefore drawn a band at a time, which is what `Hints.from_y`
+is for. The one-shot render asks for the top and nothing else. The viewer asks
+for the band around what the reader can see, fits it on width alone, and asks
+again with a new `from_y` when scrolling nears the edge of it.
+
+The reason is not memory here but what a terminal will accept. It stores the
+image, and a whole document is tens of megabytes as one texture — 63M for this
+file in a large window — which a terminal may simply refuse. So keep a band
+close to the size the one-shot path produces, since that is the size known to
+work. Laying the document out to find the band costs nothing worth counting:
+parse, layout and SVG emit together are about 270µs, against 61ms to rasterize
+and 23ms to compress. Only the drawing scales with what is on screen, which is
+the whole point.
 
 For the same reason the viewer gives a document no `ZOOM_HEADROOM`. Headroom
 buys real pixels to zoom into, which a photo has and a document does not: ask
 markdown for double the width and it returns the same words at double the size,
 to be drawn at half. That is four times the pixels for an identical-looking
-page. The cost of asking is why `MAX_PIXELS` exists at all.
+page.
+
+No terminal advertises what it will hold, so do not guess it. Transmit with
+`q=1` so refusals come back instead of vanishing, and halve the band when one
+does. Starting generous and backing off beats picking a number that suits the
+stingiest terminal.
 
 The viewer never re-encodes pixels. It transmits once, then pans and zooms by
 sending a new source rectangle for the stored image, which the terminal scales.
 A frame costs 69 bytes. Re-encoding instead measured 40-90ms and several
 megabytes per frame, so think hard before moving redrawing back into Rust.
+
+Documents are the one exception, and only because the alternative does not
+work: a whole document is too large for a terminal to store. Even there most
+frames are still the 69-byte kind, because a band holds more than the screen
+shows and only running off the end of one costs a re-render.
 
 Reuse one placement id and let the new placement replace the old one. Delete
 the old one first and the background shows through the gap, which reads as a

@@ -92,11 +92,11 @@ fn show(
     let hints = source::Hints {
         max_w: budget.cols * budget.cell.w,
         max_h: budget.rows * budget.cell.h,
-        // this writes where the cursor is and returns; anything past the
-        // screen has nowhere to go
-        overflow: source::Overflow::Clip,
+        // the one-shot render writes where the cursor is and returns, so it
+        // only ever wants the top of a document
+        from_y: 0,
     };
-    let decoded = source::load(&bytes, path, hints)?;
+    let decoded = source::load(&bytes, path, hints)?.fb;
 
     let (w, h) = geometry::fit(decoded.width(), decoded.height(), budget);
     let mut fb = framebuffer::resize(&decoded, w, h);
