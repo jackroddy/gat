@@ -18,12 +18,9 @@ pub struct Hints {
     pub max_h: u32,
 }
 
-/// A decoded source, and how much more of it there is.
+/// A decoded source.
 pub struct Loaded {
     pub fb: Framebuffer,
-    /// For a flowed source, the whole document's height, of which `fb` is one
-    /// band. For an image, simply its height.
-    pub total_h: u32,
 }
 
 /// Whether a source is a picture or a page of text.
@@ -137,8 +134,7 @@ const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd"];
 
 /// A `Loaded` for a source that was decoded in full.
 fn whole(fb: Framebuffer) -> Loaded {
-    let total_h = fb.height();
-    Loaded { fb, total_h }
+    Loaded { fb }
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

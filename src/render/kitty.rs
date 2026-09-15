@@ -108,17 +108,19 @@ pub fn emit(
 ) -> io::Result<()> {
     let q = quiet.code();
     let Encoded { w, h, payload } = img;
+
+    // C=1 stops the terminal advancing the cursor itself. its
+    // default, C=0, moves right by the placement's columns and down
+    // by its rows, and the spec leaves the result undefined once
+    // that runs past the edge of the screen. the caller places the
+    // cursor instead, which it can do deterministically
+    let action = if display { "T,C=1" } else { "t" };
+
     let mut chunks = payload.chunks(RAW_CHUNK).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
         let more = u8::from(chunks.peek().is_some());
         if first {
-            // C=1 stops the terminal advancing the cursor itself. its
-            // default, C=0, moves right by the placement's columns and down
-            // by its rows, and the spec leaves the result undefined once
-            // that runs past the edge of the screen. the caller places the
-            // cursor instead, which it can do deterministically
-            let action = if display { "T,C=1" } else { "t" };
             write!(
                 out,
                 "\x1b_Ga={action},i={id},q={q},f=32,o=z,s={w},v={h},m={more};"

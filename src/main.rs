@@ -147,6 +147,11 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Long("print") => args.print = true,
             Long("probe") => {
                 print!("terminal probe:\n{}", term::explain());
+                let t = term::Terminal::detect();
+                print!(
+                    "\nhow tall an image this terminal will take:\n{}",
+                    term::height_ladder(t.cols * t.cell.w, t.rows.saturating_sub(1) * t.cell.h)
+                );
                 return Ok(None);
             }
             Short('b') | Long("background") => {

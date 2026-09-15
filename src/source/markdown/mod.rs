@@ -49,7 +49,6 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Loaded, Error> {
     let fb = svg::rasterize(&tree, 1.0)?;
     Ok(Loaded {
         fb: crop(fb, total_h as u32, theme.bg),
-        total_h: total_h as u32,
     })
 }
 
@@ -126,14 +125,8 @@ mod tests {
         let md = "# Heading\n\n".to_owned() + &"A paragraph of body text. ".repeat(400);
         let got = load(md.as_bytes(), hints(800, u32::MAX)).unwrap();
 
-        assert!(got.total_h > 2400, "test document is too short to matter");
-        assert_eq!(
-            got.fb.height(),
-            got.total_h,
-            "the buffer is shorter than the document it reports"
-        );
         assert!(
-            got.fb.height() > 400,
+            got.fb.height() > 2400,
             "the page was cut to the viewport instead of drawn whole"
         );
     }

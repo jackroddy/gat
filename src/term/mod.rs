@@ -60,6 +60,10 @@ fn detect_measured() -> (Terminal, Measured) {
     // in the input queue, where it reaches the shell as if
     // the user had typed it, so open the tty only for a
     // question the environment cannot answer
+    //
+    // the transport is one of those questions: nothing in the
+    // environment says whether this terminal will read a file,
+    // and the answer decides whether scrolling costs anything
     let asking = pixel_cell.is_none() || env_protocol.is_none();
     let mut probe = asking.then(query::Probe::open).flatten();
 
@@ -90,6 +94,9 @@ fn detect_measured() -> (Terminal, Measured) {
         live.as_mut()
             .map_or(Protocol::None, |(p, b)| query_protocol(p, *b))
     });
+
+    // a terminal across a network cannot open a path of ours,
+    // so the question is only worth asking locally
 
     let terminal = Terminal {
         cols,
@@ -238,6 +245,105 @@ fn query_protocol(probe: &mut query::Probe, budget: Duration) -> Protocol {
         }
     }
     Protocol::None
+}
+
+/// Store and place an image at a range of heights, and report
+/// what the terminal said to each.
+//
+// this is the viewer's own sequence: store the pixels inline,
+// then place a screenful of them with a source rectangle. The
+// test images are one colour, so they deflate to almost nothing
+// and the ladder costs little despite the sizes it names.
+//
+// the replies are read through a Probe rather than left on the
+// tty, because an unread refusal reaches the shell and turns up
+// at the next prompt
+pub fn height_ladder(width: u32, view_h: u32) -> String {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+
+    let mut s = String::new();
+    let Some(mut probe) = query::Probe::open() else {
+        return "  no terminal to ask\n".into();
+    };
+    let budget = Duration::from_millis(400);
+
+    for (n, h) in [1000u32, 2000, 4000, 6000, 8192, 8193, 12000]
+        .into_iter()
+        .enumerate()
+    {
+        let id = 700 + n as u32;
+        let mb = (width as u64 * h as u64 * 4) as f64 / 1e6;
+
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        let row: Vec<u8> = (0..width).flat_map(|_| [0xd0u8, 0x40, 0xa0, 0xff]).collect();
+        for _ in 0..h {
+            let _ = z.write_all(&row);
+        }
+        let Ok(payload) = z.finish() else { continue };
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &payload);
+
+        let stored = chunked(&mut probe, id, width, h, &b64, budget);
+        let place =
+            format!("\x1b_Ga=p,i={id},x=0,y=0,w={width},h={view_h},c=24,r=1,q=1;\x1b\\");
+        let placed = said(&mut probe, &place, budget);
+        let _ = writeln!(
+            s,
+            "  {width} x {h:<6} {mb:>5.0} MB  store: {stored:<26} place: {placed}"
+        );
+    }
+    s
+}
+
+/// Send one image as the protocol's chunked escapes and report
+/// what came back.
+fn chunked(
+    probe: &mut query::Probe,
+    id: u32,
+    w: u32,
+    h: u32,
+    b64: &str,
+    budget: Duration,
+) -> String {
+    let mut chunks = b64.as_bytes().chunks(4096).peekable();
+    let mut first = true;
+    let mut last = String::from("accepted (no complaint)");
+    while let Some(chunk) = chunks.next() {
+        let more = u8::from(chunks.peek().is_some());
+        let head = if first {
+            format!("\x1b_Ga=t,i={id},q=1,f=32,o=z,s={w},v={h},m={more};")
+        } else {
+            format!("\x1b_Gq=1,m={more};")
+        };
+        first = false;
+        let escape = format!("{head}{}\x1b\\", String::from_utf8_lossy(chunk));
+
+        // only the last chunk can draw a complaint worth waiting for
+        let wait = if more == 0 {
+            budget
+        } else {
+            Duration::from_millis(1)
+        };
+        let reply = said(probe, &escape, wait);
+        if more == 0 {
+            last = reply;
+        }
+    }
+    last
+}
+
+/// Send `escape` and report the terminal's reply, or silence.
+//
+// silence is the good answer under q=1: successes are suppressed
+// and only failures come back
+fn said(probe: &mut query::Probe, escape: &str, budget: Duration) -> String {
+    let reply = probe.ask(escape.as_bytes(), budget, |b| find(b, b"\x1b\\").is_some());
+    if reply.is_empty() {
+        return "accepted (no complaint)".into();
+    }
+    String::from_utf8_lossy(&reply)
+        .trim_matches(|c: char| c.is_control() || c == '\\')
+        .to_string()
 }
 
 /// A human-readable account of what detection saw, for `--probe`.
