@@ -17,6 +17,8 @@ pub fn flatten_onto(fb: &mut Framebuffer, bg: [u8; 3]) {
         if a == 255 {
             continue;
         }
+
+        // source-over: c = (c*a + bg*(255 - a)) / 255
         for (c, &b) in px.0[..3].iter_mut().zip(bg.iter()) {
             *c = ((*c as u32 * a + b as u32 * (255 - a)) / 255) as u8;
         }

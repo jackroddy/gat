@@ -1,9 +1,6 @@
 //! Markdown events to a block tree.
 //
-// Split from layout so that layout's tests do not have to carry a parser, and
-// so that the two fiddly jobs — pulldown-cmark's event stream, and breaking
-// text into lines — stay separately debuggable. Nothing here knows about
-// pixels, fonts or SVG.
+// nothing here deals in pixels, fonts or SVG
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -25,14 +22,13 @@ pub enum Block {
 }
 
 /// Inline content, with emphasis already flattened onto each run.
-//
-// markdown nests emphasis but rendering does not care: bold inside italic is
-// just a run that is both. Flattening here keeps a style stack out of layout.
 #[derive(Debug, PartialEq)]
 pub enum Inline {
+    // markdown nests emphasis; bold inside italic is one run
+    // that is both, which keeps a style stack out of layout
     Text { text: String, style: Style },
-    /// Rendered as its alt text for now; drawing the real pixels is a later
-    /// step that needs the document's directory to resolve the link against.
+
+    /// Rendered as its alt text.
     Image { alt: String },
     Break,
 }
@@ -47,9 +43,8 @@ pub struct Style {
 }
 
 pub fn parse(text: &str) -> Doc {
-    // tables stay off deliberately: without the extension a table renders as
-    // paragraphs of pipe-separated text, which is the intended stand-in until
-    // real table layout earns its keep. footnotes likewise.
+    // tables and footnotes stay off: a table renders instead as
+    // paragraphs of pipe-separated text until layout can do one
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
 
@@ -87,7 +82,7 @@ struct Builder {
     where_: Option<Inlines>,
     alt: String,
 
-    /// Emphasis nests, so these count rather than toggle.
+    // emphasis nests, so these count rather than toggle
     bold: u32,
     italic: u32,
     strike: u32,
@@ -105,9 +100,8 @@ impl Builder {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
 
-            // a fenced block arrives as several Text events and must be
-            // rejoined before splitting on newlines, or a block that happens
-            // to be delivered mid-line gains a line break
+            // a fenced block arrives as several Text events and
+            // must be rejoined before splitting on newlines
             Event::Text(t) if self.code.is_some() => {
                 self.code.as_mut().unwrap().push_str(&t);
             }
@@ -118,10 +112,8 @@ impl Builder {
                 self.text(&t, style);
             }
 
-            // raw markup is never passed through. we are generating SVG and
-            // handing it to a parser, so letting a document inject its own
-            // elements would be an injection vector, not merely a rendering
-            // wart. block-level html is dropped, inline html shows as text
+            // the generated SVG goes to a parser, so passing
+            // markup through would let a document inject elements
             Event::Html(_) => {}
             Event::InlineHtml(t) => self.text(&t, self.style()),
 
@@ -187,6 +179,7 @@ impl Builder {
             }
             TagEnd::CodeBlock => {
                 let body = self.code.take().unwrap_or_default();
+
                 // a trailing newline is the fence's, not a blank last line
                 let body = body.strip_suffix('\n').unwrap_or(&body);
                 let lines = body.split('\n').map(str::to_owned).collect();
@@ -240,8 +233,8 @@ impl Builder {
             return;
         }
         self.open_inlines();
-        // runs that agree on style merge, so a sentence broken across several
-        // events lays out as one
+
+        // runs that agree on style merge into one
         match self.inlines.last_mut() {
             Some(Inline::Text { text, style: s }) if *s == style => text.push_str(t),
             _ => self.inlines.push(Inline::Text {
@@ -251,9 +244,9 @@ impl Builder {
         }
     }
 
-    /// A tight list item emits its text with no surrounding paragraph, so an
-    /// inline arriving out of nowhere opens one implicitly.
+    /// Open an implicit paragraph if no block is taking inlines.
     fn open_inlines(&mut self) {
+        // a tight list item emits no paragraph events
         if self.where_.is_none() {
             self.where_ = Some(Inlines::Paragraph);
         }
@@ -275,6 +268,7 @@ impl Builder {
 
     fn finish(mut self) -> Doc {
         self.flush_loose_inlines();
+
         // an unterminated container should still render what it held
         while self.levels.len() > 1 {
             let inner = self.levels.pop().unwrap();
@@ -304,10 +298,10 @@ fn heading_level(level: HeadingLevel) -> u8 {
     }
 }
 
-/// Unused today, kept because the code-block fence carries it and syntax
-/// colour will want it.
+/// The language tag on a fenced code block, if it has one.
 #[allow(dead_code)]
 fn code_language(kind: &CodeBlockKind<'_>) -> Option<String> {
+    // TODO: nothing calls this until code blocks are coloured
     match kind {
         CodeBlockKind::Fenced(lang) if !lang.is_empty() => Some(lang.to_string()),
         _ => None,
@@ -364,8 +358,6 @@ mod tests {
 
     #[test]
     fn a_soft_break_becomes_a_space_and_merges() {
-        // we re-wrap, so a newline mid-paragraph must not survive as one, and
-        // the two halves should end up in a single run
         let doc = parse("one\ntwo");
         let Block::Paragraph(inlines) = &doc.blocks[0] else {
             panic!("expected a paragraph");
@@ -388,8 +380,8 @@ mod tests {
 
     #[test]
     fn a_tight_list_still_produces_paragraphs() {
-        // tight items emit no Paragraph events at all, so without the implicit
-        // open their text would vanish
+        // tight items emit no Paragraph events at all, so without
+        // the implicit open their text would vanish
         let doc = parse("- one\n- two\n");
         let Block::List { start, items } = &doc.blocks[0] else {
             panic!("expected a list, got {:?}", doc.blocks[0]);
@@ -413,9 +405,8 @@ mod tests {
 
     #[test]
     fn raw_html_never_reaches_the_document_as_markup() {
-        // a block of html is dropped entirely; inline html survives only as
-        // text, which to_svg will escape. either way it cannot become an
-        // element in the SVG we generate
+        // neither path can become an element in the generated
+        // SVG: block html is dropped, inline html stays text
         let doc = parse("<script>bad()</script>\n\ntext <b>x</b> more\n");
         let rendered = format!("{:?}", doc);
         assert!(!rendered.contains("Html"), "html leaked into the document");

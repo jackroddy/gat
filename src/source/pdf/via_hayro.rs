@@ -21,6 +21,7 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Framebuffer, Error> {
     let (pw, ph) = page.render_dimensions();
     let scale = (hints.max_w as f32 / pw)
         .min(hints.max_h as f32 / ph)
+        // a zero-size page gives scale 0 and a 0x0 pixmap
         .max(f32::MIN_POSITIVE);
 
     let settings = InterpreterSettings {
@@ -41,8 +42,10 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Framebuffer, Error> {
         &RenderSettings {
             x_scale: scale,
             y_scale: scale,
-            // a PDF page is paper, so it composites over white rather than
-            // over the --background color used for images with real alpha
+
+            // a page composites over white rather than over
+            // the --background color used for images with
+            // real alpha
             bg_color: WHITE,
             ..Default::default()
         },

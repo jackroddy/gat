@@ -42,6 +42,7 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // TODO: the two-cell margin has no recorded origin
     let (cols, rows) = args
         .geometry
         .unwrap_or((terminal.cols.saturating_sub(2).max(1), terminal.rows.saturating_sub(2).max(1)));
@@ -92,8 +93,6 @@ fn show(
     let hints = source::Hints {
         max_w: budget.cols * budget.cell.w,
         max_h: budget.rows * budget.cell.h,
-        // the one-shot render writes where the cursor is and returns, so it
-        // only ever wants the top of a document
         from_y: 0,
     };
     let decoded = source::load(&bytes, path, hints)?.fb;
@@ -103,9 +102,10 @@ fn show(
     framebuffer::flatten_onto(&mut fb, background);
 
     render::kitty::write(out, &fb, render::kitty::next_id())?;
-    // the renderer asks the terminal to leave the cursor alone (C=1), so it
-    // is still at the image's top left corner and the next output would land
-    // on top of it
+
+    // the renderer sets C=1, so the cursor is still at the
+    // image's top left corner and the next output would
+    // land on top of it
     let rows = h.div_ceil(budget.cell.h);
     for _ in 0..rows {
         out.write_all(b"\n")?;

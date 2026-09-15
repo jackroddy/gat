@@ -18,12 +18,8 @@ pub struct Hints {
     pub max_h: u32,
     /// For a flowed source, how far down the document this slice starts.
     //
-    // a document is drawn a band at a time rather than whole. Handing a
-    // terminal the entire thing means asking it to hold tens of megabytes as
-    // one image, which it may simply refuse, and the refusal looks exactly
-    // like the feature being broken. So the viewer asks for the part it can
-    // see and asks again when it scrolls off the end, and the one-shot render
-    // asks for the top and nothing else.
+    // a document is drawn one band at a time; the whole of
+    // it can exceed what a terminal accepts as one image
     #[cfg_attr(not(feature = "markdown"), allow(dead_code))]
     pub from_y: u32,
 }
@@ -37,14 +33,11 @@ pub struct Loaded {
 }
 
 /// Whether a source is a picture or a page of text.
-//
-// the viewer fits a picture to the screen, because seeing all of it at once is
-// the point. a document taller than the screen wants the opposite: full width,
-// 1:1, and pan to read on. Nothing else distinguishes them once both are
-// pixels, so the decoder has to say which it produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    /// A picture, fitted to the screen so that all of it is visible at once.
     Image,
+    /// A page of text, drawn at full width and 1:1 and panned to read on.
     Document,
 }
 
@@ -66,17 +59,17 @@ impl std::fmt::Display for Error {
 }
 
 /// What sort of thing this is, without decoding it.
-//
-// the viewer has to know before it asks: a document and a picture want
-// different sizes requested of them, so the answer cannot arrive with the
-// pixels. sniffing twice is cheap next to decoding once.
 pub fn kind(bytes: &[u8], path: &Path) -> Kind {
+    // the size to ask a decoder for depends on the kind, so
+    // the kind has to be settled before the pixels arrive
     match sniff(bytes, path) {
         Format::Markdown => Kind::Document,
         _ => Kind::Image,
     }
 }
 
+/// Decode `bytes` into a framebuffer, choosing the decoder from the content
+/// and, where that settles nothing, from `path`.
 pub fn load(bytes: &[u8], path: &Path, #[cfg_attr(not(any(feature = "svg", feature = "pdf", feature = "pdf-pdfium")), allow(unused))] hints: Hints) -> Result<Loaded, Error> {
     match sniff(bytes, path) {
         Format::Raster => image::load_from_memory(bytes)
@@ -119,10 +112,11 @@ fn sniff(bytes: &[u8], path: &Path) -> Format {
     if bytes.starts_with(b"%PDF-") {
         return Format::Pdf;
     }
-    // the extension is consulted before the content probe below, not after.
-    // markdown has no magic number of its own, and a document *about* svg
-    // mentions <svg in its first paragraph, which the probe would otherwise
-    // read as an svg file
+
+    // the extension is the only signal for markdown, and it
+    // is read before the content probe below: a document
+    // *about* svg mentions <svg in its first paragraph,
+    // which the probe would take for an svg file
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if MARKDOWN_EXTENSIONS
         .iter()
@@ -144,11 +138,10 @@ fn sniff(bytes: &[u8], path: &Path) -> Format {
     }
 }
 
-/// Extensions that mean markdown. There is no sniffing to fall back on, so an
-/// unrecognized text file stays unknown rather than being read as markdown.
+/// Extensions that mean markdown.
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd"];
 
-/// A source that is all there in one piece, which is every source but markdown.
+/// A `Loaded` for a source that was decoded in full.
 fn whole(fb: Framebuffer) -> Loaded {
     let total_h = fb.height();
     Loaded { fb, total_h }

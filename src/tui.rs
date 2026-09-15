@@ -11,48 +11,51 @@ use crate::term::{self, RawTty, Terminal};
 
 /// How long to block on input before looking for a terminal resize.
 //
-// polling beats installing a SIGWINCH handler here: the ioctl costs
-// microseconds and a signal handler cannot safely do anything but set a flag
+// polling rather than a SIGWINCH handler: the ioctl costs
+// microseconds, and a handler can only safely set a flag
 const TICK: Duration = Duration::from_millis(250);
 
 /// How long to wait for the rest of a keypress that arrived in pieces.
 //
-// a terminal writes an arrow key as one three-byte burst and a local pty
-// delivers it whole, but the network under an ssh session may split it across
-// two reads. a buffer cut after the escape byte decodes as the escape key,
-// which quits the viewer, so a buffer ending mid sequence is worth waiting on
-//
-// only a buffer that really does end in an escape pays this, which is either
-// a split sequence or the escape key itself. the remote window is the wider
-// one because a lost segment costs a round trip to retransmit
+// a local pty delivers an arrow key's three bytes whole, but
+// an ssh session may split them across two reads, and a
+// buffer cut after the escape decodes as the escape key
 const CONTINUATION: Duration = Duration::from_millis(50);
+
+/// The same wait under an ssh session.
 const CONTINUATION_SSH: Duration = Duration::from_millis(200);
 
-/// Headroom transmitted beyond what the viewport shows, so zooming in has
-/// real pixels to enlarge rather than a blur.
+/// Transmitted size as a multiple of the viewport, for zoom.
+//
+// zooming in past the viewport needs real pixels rather
+// than an enlargement of the ones already on screen
 const ZOOM_HEADROOM: u32 = 2;
 
 /// How much document to render around what is on screen, as a multiple of the
 /// viewport height.
 //
-// the ceiling on this is not memory here but what a terminal will accept: it
-// stores the image, and handing it a whole document means tens of megabytes as
-// one texture, which it may refuse outright. The band therefore stays close to
-// the size the one-shot path produces, which is the size known to work.
-// Everything above one viewport is margin, bought so that ordinary scrolling
-// moves inside the band and costs a placement rather than a re-render.
+// the ceiling is not memory but what a terminal will store
+// as one texture; above one viewport is margin, so ordinary
+// scrolling costs a placement, not a re-render
+//
+// TODO: 1.6 is eyeballed
 const BAND: f32 = 1.6;
 
-/// How far the band will shrink when a terminal says no.
+/// The smallest band, as a multiple of the viewport height.
 //
-// terminals differ in what they will hold and none of them advertises it, so
-// rather than guess a number that suits the stingiest, start generous and back
-// off when refused. The floor stops a terminal that refuses everything from
-// driving this to nothing and re-rendering forever.
+// no terminal reports its limit, so start generous and halve
+// on refusal; the floor stops an endless retry loop
+//
+// TODO: 0.35 is eyeballed
 const BAND_FLOOR: f32 = 0.35;
 
+// TODO: the zoom range and the key steps below are eyeballed;
+//       no measurement or reference is behind them
 const MAX_ZOOM: f64 = 32.0;
 const MIN_ZOOM: f64 = 1.0;
+const PAN_STEP: f64 = 0.2;
+const ZOOM_IN: f64 = 1.25;
+const ZOOM_OUT: f64 = 0.8;
 
 pub fn run(
     files: &[PathBuf],
@@ -93,9 +96,11 @@ struct Shown {
     image: Framebuffer,
     id: u32,
     kind: source::Kind,
-    /// Where `image` starts in the document, and how tall the document is.
-    /// For an image, 0 and its own height.
+
+    /// Where `image` starts in the document; 0 for an image.
     band_y: u32,
+
+    /// The full height of the document, or of the image itself.
     doc_h: u32,
 }
 
@@ -103,9 +108,10 @@ struct Shown {
 struct View {
     zoom: f64,
 
-    /// The point of the source image held at the centre of the viewport, in
-    /// source pixels.
+    /// The source pixel column held at the centre of the viewport.
     cx: f64,
+
+    /// The source pixel row held at the centre of the viewport.
     cy: f64,
 }
 
@@ -116,10 +122,8 @@ impl View {
             cx: shown.image.width() as f64 / 2.0,
             cy: shown.doc_h as f64 / 2.0,
         };
-        // a picture opens centred, because the middle is where the subject is.
-        // a document opens at the top, because that is where the reading
-        // starts, and centring a long one would drop the reader into the
-        // middle of it
+
+        // centred, a long document would open in its middle
         if shown.kind == source::Kind::Document {
             view.cy = geom(shown, &view, cells, cell).src_h / 2.0;
         }
@@ -127,20 +131,20 @@ impl View {
     }
 }
 
-/// The spinner's frames, and how long each is shown.
+/// The spinner's frames.
 //
-// braille cycles read as motion at a size that costs one cell, and every
-// terminal that speaks the graphics protocol has the glyphs. the interval is
-// short enough to look alive without making the poll below busy
+// braille cycles read as motion and cost one cell
 const SPINNER: [char; 10] = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}',
                              '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}'];
+
+/// How long each spinner frame is shown.
+//
+// TODO: 80ms is eyeballed
 const SPIN_TICK: Duration = Duration::from_millis(80);
 
-/// How long a load may take before it is worth saying anything.
+/// How long a load may take before the spinner appears.
 //
-// most files decode faster than the eye notices, and flashing a spinner at
-// them reads as a stutter. only a wait long enough to look like a hang is
-// worth announcing
+// TODO: 120ms is eyeballed
 const PATIENCE: Duration = Duration::from_millis(120);
 
 /// A decode running on a worker thread.
@@ -149,8 +153,7 @@ struct Loading {
     began: Instant,
 }
 
-/// What a worker hands back: decoded, and already compressed, since squeezing
-/// a full-screen image is most of the wait and does no I/O.
+/// A decoded framebuffer together with its compressed form.
 struct Ready {
     shown: Shown,
     encoded: kitty::Encoded,
@@ -188,10 +191,11 @@ fn event_loop(
         cy: 0.0,
     };
     let mut load_wanted = true;
+
     // shrunk on refusal; see BAND_FLOOR
     let mut band = BAND;
-    // where in the document the next render should start; always 0 for an
-    // image, and for a document the top of the band the view needs
+
+    // the top of the band to render next; 0 for an image
     let mut wanted_y = 0u32;
     let mut dirty = true;
     let mut loading: Option<Loading> = None;
@@ -200,9 +204,9 @@ fn event_loop(
         if load_wanted {
             load_wanted = false;
             failure = None;
-            // replacing the job drops the old receiver, so a worker the user
-            // has already navigated away from finds nobody to send to and its
-            // result never lands
+
+            // replacing the job drops the receiver, so a
+            // superseded worker's result is discarded
             loading = Some(spawn_load(
                 files[index].clone(),
                 cells,
@@ -224,11 +228,12 @@ fn event_loop(
                         }) => {
                             fresh.id = kitty::next_id();
                             kitty::emit(out, &encoded, fresh.id, false, kitty::Quiet::ErrorsOnly)?;
-                            // a band fetched because the reader scrolled must
-                            // not throw away where they scrolled to
+
+                            // a band fetched mid-scroll keeps the view
                             if fresh.band_y == 0 && shown.is_none() {
                                 view = View::reset(&fresh, cells, cell);
                             }
+
                             // place the new image before dropping the old one,
                             // so the screen never shows the gap between them
                             let previous = shown.replace(fresh);
@@ -249,8 +254,6 @@ fn event_loop(
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    // the worker died without answering, which should not
-                    // happen, but hanging on a spinner forever would be worse
                     failure = Some("decode failed".into());
                     loading = None;
                     dirty = true;
@@ -259,9 +262,8 @@ fn event_loop(
             }
         }
 
-        // a view that has walked past the rendered pixels needs more of them.
-        // only ask when nothing is already on the way, or a fast scroll would
-        // queue a request per keypress
+        // request only when nothing is already on the way, or
+        // a fast scroll queues one request per keypress
         if loading.is_none()
             && let Some(s) = &shown
             && let Some(want) = needed_band(s, &view, cells, cell)
@@ -276,8 +278,6 @@ fn event_loop(
             dirty = false;
         }
 
-        // while a decode is running the loop polls fast enough to animate;
-        // otherwise it sits on the keyboard until something happens
         let wait = match &loading {
             Some(job) if job.began.elapsed() >= PATIENCE => {
                 status_line(out, cells, &spinner_text(files, index, job.began))?;
@@ -298,14 +298,10 @@ fn event_loop(
             continue;
         }
 
-        // a terminal that refused the image answers with an APC carrying an
-        // error. it arrives mixed in with the keyboard, and used to be skipped
-        // along with the acknowledgements, which is how a refusal turned into
-        // a blank screen and no explanation
+        // a refusal arrives as an APC mixed in with the keys
         if let Some(complaint) = graphics_error(&input) {
-            // a refusal is usually about size, and size is the one thing we
-            // can do something about: ask for less and try again, rather than
-            // leaving the reader with an empty screen and an error
+            // a refusal is usually about size, so halve the
+            // band and retry rather than showing nothing
             if band > BAND_FLOOR && shown.as_ref().is_some_and(|s| s.kind == source::Kind::Document)
             {
                 band = (band * 0.5).max(BAND_FLOOR);
@@ -345,9 +341,10 @@ fn event_loop(
                     if let Some(s) = &shown {
                         let g = geom(s, &view, cells, cell);
                         view.cx += dx * g.src_w;
-                        // clamped against the document, not the band, so a
-                        // scroll can walk off the rendered pixels and ask for
-                        // the next ones rather than stopping at the seam
+
+                        // clamped to the document, not the band, so a
+                        // scroll past the rendered pixels requests the
+                        // next band instead of stopping at a seam
                         view.cy = (view.cy + dy * g.src_h)
                             .clamp(g.src_h / 2.0, (g.doc_h - g.src_h / 2.0).max(g.src_h / 2.0));
                     }
@@ -359,16 +356,17 @@ fn event_loop(
 }
 
 /// Decode the source rectangle and destination cell box for the current view.
-//
-// the terminal does the scaling: the source rectangle is clipped to the image
-// and then stretched to fill the cell box, so panning and zooming cost one
-// escape sequence each and never re-encode a pixel
 fn placement(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Placement {
     let g = geom(s, view, cells, cell);
+
+    // the terminal does the scaling: the source rectangle is
+    // clipped to the image and stretched to fill the cell box,
+    // so panning and zooming never re-encode a pixel
     Placement {
         src_x: (view.cx - g.src_w / 2.0).clamp(0.0, (g.img_w - g.src_w).max(0.0)) as u32,
-        // the view is tracked in document pixels, but the pixels on hand are
-        // one band of it, so the source rectangle is measured from the band
+
+        // the view is tracked in document pixels, but the
+        // pixels on hand are one band of it
         src_y: (g.doc_top - s.band_y as f64).clamp(0.0, (g.band_h - g.src_h).max(0.0)) as u32,
         src_w: g.src_w as u32,
         src_h: g.src_h as u32,
@@ -379,11 +377,6 @@ fn placement(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Place
 }
 
 /// The band this view needs, when the one on hand does not reach it.
-//
-// scrolling walks the view down the document while the band stays put, so
-// sooner or later the window runs off the end of what was rendered. Asking
-// early, while there is still a margin of band left, means the new pixels
-// usually arrive before the reader gets to the part they cover.
 fn needed_band(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Option<u32> {
     if s.kind != source::Kind::Document {
         return None;
@@ -391,7 +384,11 @@ fn needed_band(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Opt
     let g = geom(s, view, cells, cell);
     let band_y = s.band_y as f64;
     let slack = ((g.band_h - g.src_h) / 2.0).max(0.0);
-    // ask when less than a quarter of the margin is left, not when it runs out
+
+    // request while a quarter of the margin is left, so the
+    // new pixels usually arrive before the reader needs them
+    //
+    // TODO: 0.25 is eyeballed
     let trigger = slack * 0.25;
 
     let above = g.doc_top - band_y;
@@ -402,7 +399,6 @@ fn needed_band(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Opt
         return None;
     }
 
-    // centre the new band on where the reader is
     let want = (g.doc_top - slack).clamp(0.0, (g.doc_h - g.band_h).max(0.0)) as u32;
     (want != s.band_y).then_some(want)
 }
@@ -416,6 +412,7 @@ struct Geom {
     shown_h: f64,
     src_w: f64,
     src_h: f64,
+
     /// Top of the visible window, in document pixels.
     doc_top: f64,
 }
@@ -428,15 +425,13 @@ fn geom(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Geom {
     let view_w = (cols * cell.w) as f64;
     let view_h = (rows * cell.h) as f64;
 
-    // zoom 1.0 shows the whole image, but never enlarges it past its own
-    // pixels, which matches what the one-shot path does without --upscale.
-    //
-    // a document is fitted on width alone. fitting its height too would shrink
-    // a long page until the text was unreadable, and would leave nothing to
-    // pan to, because the whole thing would already be on screen. width-only
-    // is what every pager does: full size, and scroll to read on
     let base = match s.kind {
+        // width alone: fitting the height too would shrink a
+        // long page until the text was unreadable
         source::Kind::Document => (view_w / img_w).min(1.0),
+
+        // fitted whole, and never enlarged past its own
+        // pixels, as the one-shot path does without --upscale
         source::Kind::Image => (view_w / img_w).min(view_h / doc_h).min(1.0),
     };
     let scale = (base * view.zoom).max(f64::MIN_POSITIVE);
@@ -505,13 +500,8 @@ fn load(
     let bytes = std::fs::read(path)?;
     let kind = source::kind(&bytes, path);
 
-    // headroom buys real pixels to zoom into, which a photo needs because its
-    // detail is already there to be found. a document has no such detail: it
-    // is drawn at whatever size it is asked for, and asking for double gives
-    // back the same words at double the size, to be displayed at half. That is
-    // four times the pixels for an identical-looking page, and on a long
-    // document it is the difference between a framebuffer of tens and of
-    // hundreds of megabytes
+    // a document is drawn at the size asked for, so headroom
+    // costs four times the pixels for the same page
     let headroom = match kind {
         source::Kind::Document => 1,
         source::Kind::Image => ZOOM_HEADROOM,
@@ -527,10 +517,8 @@ fn load(
     };
     let source::Loaded { fb: decoded, total_h } = source::load(&bytes, path, hints)?;
 
-    // transmitting the full source of a large photo would burn the terminal's
-    // image quota for detail no zoom level reaches. a document is exempt: its
-    // height is the document, and shrinking it to a screenful would throw away
-    // the text that panning is for
+    // a document is exempt: its height is the document, and a
+    // screenful of it would drop the text panning is for
     let height_limit = match kind {
         source::Kind::Document => f64::INFINITY,
         source::Kind::Image => hints.max_h as f64,
@@ -558,12 +546,6 @@ fn load(
 }
 
 /// Decode and compress `path` on a worker thread.
-//
-// both halves go here, not just the decode. compressing a full-screen image is
-// most of the wait on a fast machine and all of it on a slow one, so leaving
-// it on the main thread would freeze the spinner for exactly the stretch the
-// spinner exists to cover. only the write stays behind, because only the write
-// touches the terminal
 fn spawn_load(
     path: PathBuf,
     cells: (u32, u32),
@@ -577,11 +559,14 @@ fn spawn_load(
         let result = load(&path, cells, cell, background, from_y, band)
             .map_err(|e| e.to_string())
             .and_then(|shown| {
+                // compressing a full-screen image is most of
+                // the wait; only the write needs the terminal
                 kitty::encode(&shown.image)
                     .map(|encoded| Ready { shown, encoded })
                     .map_err(|e| e.to_string())
             });
-        // the viewer may have quit while we worked; nobody left to tell
+
+        // the receiver is gone if the viewer has moved on
         let _ = tx.send(result);
     });
     Loading {
@@ -596,15 +581,13 @@ fn spinner_frame(elapsed: Duration) -> char {
     SPINNER[step % SPINNER.len()]
 }
 
-/// What to say while waiting.
+/// The status line shown while a decode runs.
 fn spinner_text(files: &[PathBuf], index: usize, began: Instant) -> String {
     let frame = spinner_frame(began.elapsed());
     let name = files[index]
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    // the elapsed time is the part that distinguishes "slow" from "wedged",
-    // which is the question someone watching a spinner is actually asking
     format!(
         "{frame} rendering {name}  [{}/{}]  {:.1}s  q quits",
         index + 1,
@@ -621,13 +604,12 @@ fn status_line(out: &mut impl Write, cells: (u32, u32), text: &str) -> std::io::
 }
 
 /// The terminal's complaint about a graphics command, if `buf` holds one.
-//
-// the protocol answers in an APC of the form ESC _ G <key>=<value>,... ;
-// <message> ESC \, where the message is OK on success and something like
-// ENOENT or EINVAL otherwise. Only the failures are interesting, and only
-// because the alternative is a blank screen with nothing said about it.
 fn graphics_error(buf: &[u8]) -> Option<String> {
     let mut i = 0;
+
+    // the protocol answers in an APC of the form
+    // ESC _ G <key>=<value>,... ; <message> ESC \, where the
+    // message is OK on success and ENOENT, EINVAL or similar
     while let Some(start) = find(&buf[i..], b"\x1b_G").map(|p| i + p) {
         let Some(end) = find(&buf[start..], b"\x1b\\").map(|p| start + p) else {
             break;
@@ -661,10 +643,9 @@ fn read_burst(tty: &mut RawTty, first: Duration, rest: Duration) -> Vec<u8> {
 /// Every key in `buf`, which is taken to be a complete burst.
 fn keys_from(buf: &[u8]) -> Vec<Key> {
     let (mut keys, used) = decode_keys(buf);
-    // an escape still standing alone once [`read_burst`] has waited is the
-    // escape key, not the head of a sequence that has yet to arrive. anything
-    // longer left over is a sequence the terminal never finished, and stays
-    // dropped
+
+    // an escape still alone once read_burst has waited is the
+    // escape key, not the head of an unfinished sequence
     if buf.len() - used == 1 && buf[used] == 0x1b {
         keys.push(Key::Quit);
     }
@@ -696,28 +677,28 @@ fn decode_keys(buf: &[u8]) -> (Vec<Key>, usize) {
                 break;
             };
             match buf[end] {
-                b'A' => keys.push(Key::Pan(0.0, -0.2)),
-                b'B' => keys.push(Key::Pan(0.0, 0.2)),
-                b'C' => keys.push(Key::Pan(0.2, 0.0)),
-                b'D' => keys.push(Key::Pan(-0.2, 0.0)),
+                b'A' => keys.push(Key::Pan(0.0, -PAN_STEP)),
+                b'B' => keys.push(Key::Pan(0.0, PAN_STEP)),
+                b'C' => keys.push(Key::Pan(PAN_STEP, 0.0)),
+                b'D' => keys.push(Key::Pan(-PAN_STEP, 0.0)),
                 _ => {}
             }
             i = end + 1;
             continue;
         }
-        // an escape with nothing behind it may be the whole keypress or may
-        // be the head of a sequence still on the wire; the caller settles it
+
+        // the caller settles what a trailing escape means
         if buf[i] == 0x1b && i + 1 == buf.len() {
             break;
         }
         match buf[i] {
             b'q' | 0x1b | 0x03 => keys.push(Key::Quit),
-            b'h' => keys.push(Key::Pan(-0.2, 0.0)),
-            b'l' => keys.push(Key::Pan(0.2, 0.0)),
-            b'k' => keys.push(Key::Pan(0.0, -0.2)),
-            b'j' => keys.push(Key::Pan(0.0, 0.2)),
-            b'+' | b'=' => keys.push(Key::Zoom(1.25)),
-            b'-' | b'_' => keys.push(Key::Zoom(0.8)),
+            b'h' => keys.push(Key::Pan(-PAN_STEP, 0.0)),
+            b'l' => keys.push(Key::Pan(PAN_STEP, 0.0)),
+            b'k' => keys.push(Key::Pan(0.0, -PAN_STEP)),
+            b'j' => keys.push(Key::Pan(0.0, PAN_STEP)),
+            b'+' | b'=' => keys.push(Key::Zoom(ZOOM_IN)),
+            b'-' | b'_' => keys.push(Key::Zoom(ZOOM_OUT)),
             b'0' => keys.push(Key::Reset),
             b'n' | b' ' => keys.push(Key::Next),
             b'p' => keys.push(Key::Prev),
@@ -748,9 +729,6 @@ mod tests {
 
     #[test]
     fn a_refused_image_is_reported_rather_than_skipped() {
-        // this is the whole point: a terminal that will not take the image
-        // says so, and the viewer used to throw the sentence away and show an
-        // empty screen instead
         let refusal = b"\x1b_Gi=31;EINVAL:image too large\x1b\\";
         let got = graphics_error(refusal).expect("refusal was not noticed");
         assert!(got.contains("EINVAL"), "{got}");
@@ -761,6 +739,7 @@ mod tests {
     fn an_acknowledgement_is_not_an_error() {
         assert_eq!(graphics_error(b"\x1b_Gi=31,I=1;OK\x1b\\"), None);
         assert_eq!(graphics_error(b"hello"), None);
+
         // a half-arrived reply must not be read as a complaint either
         assert_eq!(graphics_error(b"\x1b_Gi=31;EINV"), None);
     }
@@ -769,7 +748,6 @@ mod tests {
     fn a_refusal_is_found_even_mixed_in_with_typing() {
         let mixed = b"j\x1b_Gi=7;ENOMEM\x1b\\k";
         assert!(graphics_error(mixed).is_some());
-        // and the keys around it still decode
         assert_eq!(keys_from(mixed).len(), 2);
     }
 
@@ -777,17 +755,14 @@ mod tests {
     fn the_spinner_cycles_and_never_leaves_the_frame_list() {
         assert_eq!(spinner_frame(Duration::ZERO), SPINNER[0]);
         assert_eq!(spinner_frame(SPIN_TICK), SPINNER[1]);
-        // it has to wrap rather than panic, and a long wait is exactly when
-        // an index out of range would be least welcome
         assert_eq!(spinner_frame(SPIN_TICK * SPINNER.len() as u32), SPINNER[0]);
         assert_eq!(spinner_frame(Duration::from_secs(3600)), SPINNER[0]);
     }
 
     #[test]
     fn nothing_is_said_about_a_wait_too_short_to_notice() {
-        // flashing a spinner at a decode that finishes in a frame or two reads
-        // as a stutter, so PATIENCE has to be long enough to sit out the fast
-        // path and short enough to beat the eye's patience
+        // long enough to sit out a decode that finishes in a
+        // frame or two, short enough to announce a slow one
         assert!(PATIENCE >= SPIN_TICK);
         assert!(PATIENCE < Duration::from_millis(500));
     }
@@ -804,9 +779,8 @@ mod tests {
 
     #[test]
     fn a_document_is_fitted_on_width_and_scrolls() {
-        // a picture wants to be seen whole, so it is fitted on both axes and
-        // has nowhere to pan at rest. a page of text fitted that way would be
-        // shrunk until it was unreadable, and would leave nothing to scroll to
+        // an image is fitted on both axes and has nowhere to
+        // pan at rest; a page fitted that way is unreadable
         let page = Framebuffer::new(900, 6000);
         let v = view(1.0, 450.0, 200.0);
 
@@ -830,11 +804,9 @@ mod tests {
         let s = shown(Framebuffer::new(900, 1000), source::Kind::Document, 0, 6000);
         let cells = (100, 30);
 
-        // at the very top, nothing more is wanted
         let top = View::reset(&s, cells, CELL);
         assert_eq!(needed_band(&s, &top, cells, CELL), None);
 
-        // scrolled to the bottom of the band, the next one is due
         let g = geom(&s, &top, cells, CELL);
         let edge = View {
             cy: 1000.0 - g.src_h / 2.0,
@@ -846,7 +818,7 @@ mod tests {
 
     #[test]
     fn a_picture_never_asks_for_another_band() {
-        // bands are a markdown idea; an image is all there at once
+        // an image is transmitted whole, so there is no next band
         let s = shown(Framebuffer::new(900, 6000), source::Kind::Image, 0, 6000);
         let v = View::reset(&s, (100, 30), CELL);
         assert_eq!(needed_band(&s, &v, (100, 30), CELL), None);
@@ -854,8 +826,8 @@ mod tests {
 
     #[test]
     fn the_last_band_of_a_document_asks_for_nothing_more() {
-        // a band that reaches the end must not keep requesting itself, which
-        // would re-render forever at the bottom of every document
+        // a band reaching the end must not request itself
+        // forever at the bottom of every document
         let s = shown(Framebuffer::new(900, 1000), source::Kind::Document, 5000, 6000);
         let bottom = View {
             zoom: 1.0,
@@ -867,7 +839,6 @@ mod tests {
 
     #[test]
     fn a_document_opens_at_its_first_line() {
-        // centring a long document drops the reader into the middle of it
         let page = Framebuffer::new(900, 6000);
         let s = shown(page, source::Kind::Document, 0, 6000);
         let v = View::reset(&s, (100, 30), CELL);
@@ -889,9 +860,9 @@ mod tests {
         let wide = placement(&shown(img.clone(), source::Kind::Image, 0, img.height()), &view(1.0, 500.0, 250.0), (80, 25), CELL);
         let close = placement(&shown(img.clone(), source::Kind::Image, 0, img.height()), &view(2.0, 500.0, 250.0), (80, 25), CELL);
         assert!(close.src_w < wide.src_w && close.src_h < wide.src_h);
-        // the axis that was already filling the viewport halves exactly; the
-        // letterboxed axis shows less than half, because zooming first eats
-        // the bars
+        // the axis that was already filling the viewport
+        // halves exactly; the letterboxed axis shows less
+        // than half, because zooming first removes the bars
         assert_eq!(close.src_w, wide.src_w / 2);
         assert!(close.src_h > wide.src_h / 2);
     }
@@ -970,13 +941,12 @@ mod tests {
 
     #[test]
     fn an_arrow_key_split_by_the_network_is_not_a_quit() {
-        // the first half of a keypress that ssh delivered in two reads. it
-        // must be held back rather than decoded, or panning quits the viewer
+        // the first half of an arrow key that ssh delivered
+        // in two reads
         let (keys, used) = decode_keys(b"\x1b");
         assert!(keys.is_empty());
         assert_eq!(used, 0, "the escape has to survive for the next read");
 
-        // and once the rest lands, it pans like any other arrow key
         assert!(matches!(
             keys_from(b"\x1b[A").as_slice(),
             [Key::Pan(0.0, y)] if *y < 0.0

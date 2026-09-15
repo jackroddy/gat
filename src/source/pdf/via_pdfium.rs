@@ -21,8 +21,9 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Framebuffer, Error> {
         .first()
         .map_err(|e| Error::Decode(e.to_string()))?;
 
-    // vector input, so rasterize at display size; the bounds are given both
-    // ways because the page aspect ratio decides which one binds
+    // vector input, so rasterize at display size; both
+    // bounds are given because which one binds depends on
+    // the page aspect ratio
     let config = PdfRenderConfig::new()
         .set_target_width(hints.max_w as i32)
         .set_maximum_height(hints.max_h as i32);

@@ -14,14 +14,17 @@ use rustix::termios::{
 // tty next, which is the user's shell: it appears as though they typed the
 // escape sequence at their prompt. tcsetattr(TCSAFLUSH) discards only what
 // has already queued, so a slow terminal needs this grace window too
+//
+// TODO: 60ms has no recorded source
 const DRAIN_GRACE: Duration = Duration::from_millis(60);
 
-/// The most [`Probe::set_grace`] will widen that window to.
+/// The longest drain window [`Probe::set_grace`] will widen to.
 //
-// nothing arriving is the usual outcome, and drain() cannot tell that from a
-// reply still in flight, so it waits out the whole window every time. the
-// grace is a cost paid on every query, not just on the rare late one, which
-// is why it stays well below the reply budget however far away the terminal
+// drain() cannot tell nothing arriving from a reply still
+// in flight, so it waits out the whole window on every
+// query, not just on the rare late one
+//
+// TODO: 250ms has no recorded source
 const MAX_GRACE: Duration = Duration::from_millis(250);
 
 /// A borrowed controlling terminal, switched into a mode where escape-sequence
@@ -33,6 +36,8 @@ pub struct Probe {
 }
 
 impl Probe {
+    /// A probe on the controlling terminal, or `None` if it cannot be opened
+    /// and switched into that mode.
     pub fn open() -> Option<Probe> {
         let tty = OpenOptions::new().read(true).write(true).open("/dev/tty").ok()?;
         let original = tcgetattr(&tty).ok()?;
@@ -40,6 +45,7 @@ impl Probe {
         let mut raw = original.clone();
         raw.local_modes &= !(LocalModes::ICANON | LocalModes::ECHO);
         raw.input_modes = rustix::termios::InputModes::empty();
+
         // read() returns whatever has arrived without blocking; the deadline
         // is enforced by poll() below rather than by VTIME, which cannot
         // express a budget shared across several reads
@@ -66,8 +72,7 @@ impl Probe {
     }
 
     /// Send `query` and report how long `done` took to accept the reply, or
-    /// `None` if it never did. For measuring the link rather than reading an
-    /// answer off it.
+    /// `None` if it never did.
     pub fn timed(
         &mut self,
         query: &[u8],
@@ -77,9 +82,8 @@ impl Probe {
         self.exchange(query, budget, done).1
     }
 
-    /// Widen the drain window, for a terminal far enough away that
-    /// [`DRAIN_GRACE`] would restore the tty while a reply is still in
-    /// flight. Never narrows it, and never past [`MAX_GRACE`].
+    /// Widen the drain window to `grace`, never narrowing it and never past
+    /// [`MAX_GRACE`].
     pub fn set_grace(&mut self, grace: Duration) {
         self.grace = grace.clamp(DRAIN_GRACE, MAX_GRACE);
     }
@@ -139,6 +143,7 @@ impl Probe {
                 Ok(0) => break,
                 Ok(n) => {
                     got.extend_from_slice(&buf[..n]);
+
                     // a short read means the queue is drained; a full one may
                     // have more behind it, such as a pasted burst of keys
                     if n < buf.len() {

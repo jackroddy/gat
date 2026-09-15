@@ -14,7 +14,7 @@ impl CellSize {
     pub const FALLBACK: CellSize = CellSize { w: 9, h: 18 };
 }
 
-/// How much room an image may occupy, and what liberties the fit may take.
+/// The space available to an image, and the scaling options the fit applies.
 #[derive(Clone, Copy, Debug)]
 pub struct Budget {
     pub cols: u32,
@@ -35,9 +35,6 @@ pub fn fit(img_w: u32, img_h: u32, budget: &Budget) -> (u32, u32) {
     let w_frac = avail_w / iw;
     let h_frac = avail_h / ih;
 
-    // the pixel-direct protocols address real pixels, so unlike the
-    // block-drawing modes there is no cell aspect ratio to correct for
-
     if !budget.upscale
         && !budget.fill_width
         && !budget.fill_height
@@ -47,6 +44,8 @@ pub fn fit(img_w: u32, img_h: u32, budget: &Budget) -> (u32, u32) {
         return (img_w, img_h);
     }
 
+    // the kitty protocol addresses real pixels, so there is
+    // no cell aspect ratio to correct for
     let frac = match (budget.fill_width, budget.fill_height) {
         (true, true) => w_frac.max(h_frac),
         (true, false) => w_frac,

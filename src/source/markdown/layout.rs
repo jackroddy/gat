@@ -1,20 +1,12 @@
-//! A block tree to a flat display list.
-//
-// This is the seam the design turns on. Everything above is markdown and
-// everything below is SVG, but this file is neither: it produces positioned
-// rectangles and styled runs in pixels. Replacing the SVG backend later means
-// rewriting to_svg.rs and leaving this and its tests alone.
-//
-// Wrapping works in whole columns and converts to pixels only when a run is
-// emitted. That is not an optimisation, it is what makes the tests readable:
-// "this wraps at 40 columns" is exact, where a float-pixel assertion is a
-// guess with a tolerance attached.
+//! A block tree to a flat display list: positioned rectangles
+//! and styled runs, in pixels.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::font;
 use super::parse::{Block, Doc, Inline, Style};
 
+/// A colour, as red, green, blue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
@@ -56,7 +48,6 @@ pub struct Theme {
     pub code_bg: Rgb,
     pub rule: Rgb,
     pub quote_bar: Rgb,
-    /// Body text size in pixels; headings scale off it.
     pub base_size: f32,
     pub heading_scale: [f32; 6],
     pub line_ratio: f32,
@@ -74,6 +65,9 @@ impl Theme {
         rule: Rgb(0x3a, 0x3a, 0x3a),
         quote_bar: Rgb(0x4a, 0x4a, 0x4a),
         base_size: 16.0,
+
+        // TODO: these three were eyeballed against a terminal,
+        //       not derived from anything
         heading_scale: [2.0, 1.6, 1.3, 1.15, 1.0, 1.0],
         line_ratio: 1.45,
         margin: 16.0,
@@ -81,9 +75,6 @@ impl Theme {
 }
 
 /// Lay `doc` out into a page exactly `width` pixels across.
-//
-// the height falls out of the content; the caller decides how much of it to
-// actually draw.
 pub fn layout(doc: &Doc, theme: &Theme, width: f32) -> Page {
     let mut c = Cursor {
         theme,
@@ -110,6 +101,8 @@ impl Cursor<'_> {
     fn blocks(&mut self, blocks: &[Block], x: f32, w: f32) {
         for (i, b) in blocks.iter().enumerate() {
             if i > 0 {
+                // TODO: this and the other spacing multipliers
+                //       in this impl were eyeballed
                 self.y += self.theme.base_size * 0.6;
             }
             self.block(b, x, w);
@@ -119,9 +112,11 @@ impl Cursor<'_> {
     fn block(&mut self, b: &Block, x: f32, w: f32) {
         match b {
             Block::Heading { level, inlines } => {
+                // heading_scale has six entries, one per level
                 let size = self.theme.base_size
                     * self.theme.heading_scale[(*level as usize - 1).min(5)];
-                // a heading needs air above it, but not at the top of a page
+
+                // space above a heading, but not at the top of a page
                 if self.y > self.theme.margin {
                     self.y += size * 0.4;
                 }
@@ -152,7 +147,6 @@ impl Cursor<'_> {
         }
     }
 
-    /// Wrap `inlines` into `w` pixels at `size` and emit the runs.
     fn flow(&mut self, inlines: &[Inline], x: f32, w: f32, size: f32, base: Style) {
         let advance = size * font::ADVANCE_RATIO;
         let cols = ((w / advance).floor() as usize).max(1);
@@ -193,8 +187,8 @@ impl Cursor<'_> {
         let pad = size * 0.5;
         let cols = ((w - 2.0 * pad) / advance).floor().max(1.0) as usize;
 
-        // code never soft-wraps; tabs become columns first, then anything
-        // still too long is cut at the edge rather than silently lost
+        // code never soft-wraps: tabs expand to columns, then an
+        // over-long line is broken onto further lines
         let drawn: Vec<String> = lines
             .iter()
             .flat_map(|l| hard_split(&expand_tabs(l), cols))
@@ -231,8 +225,9 @@ impl Cursor<'_> {
     fn quote(&mut self, inner: &[Block], x: f32, w: f32) {
         let size = self.theme.base_size;
         let indent = size * font::ADVANCE_RATIO * 2.0;
-        // the bar's height is not known until the contents are laid out, so
-        // remember where it belongs and insert it once they are
+
+        // the bar's height is not known until the contents are
+        // laid out, so reserve its slot and insert it after
         let at = self.items.len();
         let y0 = self.y;
 
@@ -264,9 +259,8 @@ impl Cursor<'_> {
             };
             let indent = (marker.width() + 1) as f32 * advance;
 
-            // the marker sits on the first line's baseline, which only exists
-            // once that line has been placed, so draw the body first and
-            // measure back to it
+            // the marker sits on the first line's baseline, which
+            // exists only once the body has been placed
             let at = self.items.len();
             let y0 = self.y;
             self.blocks(item, x + indent, (w - indent).max(1.0));
@@ -315,8 +309,8 @@ fn wrap(inlines: &[Inline], cols: usize, base: Style) -> Vec<Vec<Piece>> {
             continue;
         };
 
-        // only the first chunk of a split word inherits the incoming space;
-        // the rest are continuations of it
+        // the incoming space goes before the first chunk only;
+        // the rest are continuations of the same word
         let mut spaced = space_before;
         for chunk in hard_split(&text, cols) {
             let width = chunk.width();
@@ -325,7 +319,9 @@ fn wrap(inlines: &[Inline], cols: usize, base: Style) -> Vec<Vec<Piece>> {
                 lines.push(std::mem::take(&mut line));
                 col = 0;
             }
-            // a space never survives to the start of a line
+
+            // recomputed because the wrap above may have reset
+            // col to 0, where a space never survives
             let gap = usize::from(spaced && col > 0);
             let at = col + gap;
             place(&mut line, at, &chunk, style, gap == 1);
@@ -339,9 +335,10 @@ fn wrap(inlines: &[Inline], cols: usize, base: Style) -> Vec<Vec<Piece>> {
     lines
 }
 
-/// Append `text` at column `at`, joining the previous piece when the style
-/// matches so a sentence is one run rather than one run per word.
+/// Append `text` at column `at`, joining the previous piece when the
+/// style matches.
 fn place(line: &mut Vec<Piece>, at: usize, text: &str, style: Style, spaced: bool) {
+    // one run per sentence rather than one per word
     if let Some(p) = line.last_mut()
         && p.style == style
         && p.col + p.text.width() + usize::from(spaced) == at
@@ -359,18 +356,15 @@ fn place(line: &mut Vec<Piece>, at: usize, text: &str, style: Style, spaced: boo
     });
 }
 
-/// One word, or a forced line break.
 enum Tok {
     Word {
         text: String,
         style: Style,
         /// Whether whitespace actually separated this word from the last one.
         //
-        // this cannot be inferred from "is there anything to the left", which
-        // is the tempting shortcut. markdown splits `**bold**, more` into a
-        // bold run and a plain run beginning with a comma, and inserting a
-        // space between them because both are non-empty puts a gap before
-        // every piece of punctuation that follows emphasis
+        // markdown splits `**bold**, more` into a bold run and a
+        // plain run beginning with a comma, so inferring a space
+        // from "is anything to the left" spaces off punctuation
         space_before: bool,
     },
     Break,
@@ -417,8 +411,9 @@ fn tokens(inlines: &[Inline], base: Style) -> Vec<Tok> {
                     });
                     first = false;
                 }
-                // a run that is nothing but whitespace still separates its
-                // neighbours, so the gap it leaves has to outlive it
+
+                // a run of only whitespace still separates its
+                // neighbours, so gap stays set for the next one
                 gap = if first {
                     gap || !text.is_empty()
                 } else {
@@ -430,8 +425,8 @@ fn tokens(inlines: &[Inline], base: Style) -> Vec<Tok> {
     out
 }
 
-/// Break `s` into chunks of at most `cols` display columns, never splitting a
-/// `char`. A string that already fits comes back whole.
+/// Break `s` into chunks of at most `cols` display columns, never
+/// splitting a `char`.
 fn hard_split(s: &str, cols: usize) -> Vec<String> {
     if s.width() <= cols {
         return vec![s.to_owned()];
@@ -454,8 +449,7 @@ fn hard_split(s: &str, cols: usize) -> Vec<String> {
     out
 }
 
-/// Tabs to the next multiple of four. SVG has no tab, so this has to happen
-/// before the text is measured or drawn.
+/// Tabs expanded to the next multiple of four.
 fn expand_tabs(s: &str) -> String {
     if !s.contains('\t') {
         return s.to_owned();
@@ -553,15 +547,14 @@ mod tests {
         assert_eq!(line[0].col, 0);
         assert_eq!(line[1].text, "loud");
         assert_eq!(line[1].col, 6);
-        // "plain again" is two words at one style and must be a single run
         assert_eq!(line[2].text, "plain again");
     }
 
     #[test]
     fn punctuation_after_emphasis_does_not_gain_a_space() {
-        // markdown hands "**bold**, then" over as two runs, the second of
-        // which starts with the comma. Spacing them apart because both are
-        // non-empty is the bug this guards
+        // markdown hands "**bold**, then" over as two runs, the
+        // second starting with the comma; spacing them apart is
+        // the bug guarded here
         let inlines = vec![
             Inline::Text {
                 text: "bold".into(),

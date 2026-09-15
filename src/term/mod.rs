@@ -13,7 +13,7 @@ pub enum Protocol {
     None,
 }
 
-/// What we managed to learn about the terminal we are writing to.
+/// The terminal being written to: its size, its cell size, and its protocol.
 #[derive(Clone, Copy, Debug)]
 pub struct Terminal {
     pub cols: u32,
@@ -22,18 +22,21 @@ pub struct Terminal {
     pub protocol: Protocol,
 }
 
-/// The longest detection will wait for a reply: from a terminal in this
-/// machine, and from one at the far end of an ssh connection.
+/// The longest detection will wait for a reply from a terminal on this
+/// machine.
 //
-// a budget is a ceiling, not a cost. a terminal that answers ends the wait
-// the moment its reply lands, so only silence pays the whole thing, and a
-// terminal that stays silent through a status report was not going to render
-// an image either. that is what makes the remote ceiling affordable: it
-// lengthens a run that already fails, and leaves every local run alone
+// TODO: 250ms has no recorded source
 const LOCAL_CEILING: Duration = Duration::from_millis(250);
+
+/// The longest detection will wait for a reply from a terminal at the far end
+/// of an ssh connection.
+//
+// TODO: 1500ms has no recorded source
 const REMOTE_CEILING: Duration = Duration::from_millis(1500);
 
 impl Terminal {
+    /// The terminal this process is writing to, as far as the environment and
+    /// the terminal itself will say.
     pub fn detect() -> Terminal {
         detect_measured().0
     }
@@ -53,9 +56,10 @@ fn detect_measured() -> (Terminal, Measured) {
     let (cols, rows, pixel_cell) = window_size();
     let env_protocol = protocol_from_env();
 
-    // touching termios at all risks leaving a stray reply in the input
-    // queue, where it reaches the shell as if the user had typed it, so
-    // open the tty only for a question the environment cannot answer
+    // touching termios at all risks leaving a stray reply
+    // in the input queue, where it reaches the shell as if
+    // the user had typed it, so open the tty only for a
+    // question the environment cannot answer
     let asking = pixel_cell.is_none() || env_protocol.is_none();
     let mut probe = asking.then(query::Probe::open).flatten();
 
@@ -70,11 +74,10 @@ fn detect_measured() -> (Terminal, Measured) {
         _ => None,
     };
 
-    // a terminal that let a status report go unanswered is either absent or
-    // behind something that swallows escape sequences, a multiplexer without
-    // passthrough being the usual something. graphics escapes would not reach
-    // it either, so stop asking rather than spend two more timeouts finding
-    // out, and leave the protocol at None so nothing is emitted into the void
+    // a terminal silent through a status report is absent,
+    // or behind a multiplexer without passthrough; either
+    // way graphics escapes would not reach it, so stop
+    // asking and leave the protocol at None
     let mut live = match (probe.as_mut(), rtt) {
         (Some(p), Some(rtt)) => Some((p, reply_budget(rtt, ceiling))),
         _ => None,
@@ -97,45 +100,43 @@ fn detect_measured() -> (Terminal, Measured) {
     (terminal, measured)
 }
 
-/// Time one round trip to the terminal, so that the waits which follow are
-/// sized to the link instead of to a guess about it.
-//
-// a device status report is the right yardstick: every terminal back to the
-// vt100 answers it, none of them has to think about the answer, and the reply
-// is unmistakable. the two queries below are the ones whose answers vary by
-// terminal, which makes them the wrong place to learn how far away it is
+/// Time one round trip to the terminal: how long a device status report takes
+/// to come back.
 fn calibrate(probe: &mut query::Probe, ceiling: Duration) -> Option<Duration> {
+    // every terminal answers a device status report; the
+    // replies to the two queries below vary by terminal
     let rtt = probe.timed(b"\x1b[5n", ceiling, |b| find(b, b"\x1b[0n").is_some())?;
-    // a late reply has to cross the link too, so the window for catching one
-    // before the tty goes back to the shell grows with the link
+
+    // a late reply crosses the link too, so the window for
+    // catching one before the tty returns to the shell
+    // grows with the link
     probe.set_grace(rtt);
     Some(rtt)
 }
 
 /// How long to wait for a reply, given a measured round trip.
-//
-// four round trips of headroom: the link jitters, and a terminal puts more
-// work into composing a version string than into a status report. the floor
-// is what a local terminal was given outright before there was anything to
-// measure, so no terminal on this machine now waits less than it used to
 fn reply_budget(rtt: Duration, ceiling: Duration) -> Duration {
+    // headroom for jitter, and for a terminal that takes
+    // longer to compose a version string than a status
+    // report
+    //
+    // TODO: the factor of four is unmeasured
     (rtt * 4).clamp(LOCAL_CEILING, ceiling)
 }
 
 fn reply_ceiling() -> Duration {
+    // a ceiling is paid in full only by a terminal that
+    // stays silent, and one that answers no status report
+    // would not render an image either, so the remote
+    // ceiling only lengthens a run that already fails
     if over_ssh() { REMOTE_CEILING } else { LOCAL_CEILING }
 }
 
-/// Whether this process is at the far end of an ssh connection. sshd sets
-/// both of these in the session it spawns and neither leaks into an unrelated
-/// local shell, so either one settles it.
-//
-// the terminal is still the local emulator and it still speaks the graphics
-// protocol; all that changed is that every question now costs a network round
-// trip, and that none of the variables the emulator sets about itself
-// survived the hop. a link ssh cannot be spotted on, mosh or a serial console,
-// still gets the local ceiling and may still need --force-kitty
+/// Whether this process is at the far end of an ssh connection.
 pub fn over_ssh() -> bool {
+    // sshd sets both in the session it spawns, and neither
+    // leaks into an unrelated local shell, so either one
+    // settles it
     std::env::var_os("SSH_TTY").is_some() || std::env::var_os("SSH_CONNECTION").is_some()
 }
 
@@ -154,10 +155,11 @@ fn window_size() -> (u32, u32, Option<CellSize>) {
     .into_iter()
     .find_map(|fd| rustix::termios::tcgetwinsize(fd).ok());
 
-    // a terminal that reports zero cells is telling us it does not know, the
-    // same as the ioctl failing outright; a 1x1 viewport is never the answer
+    // zero cells means the terminal has no size to report,
+    // the same as the ioctl failing outright
     let ws = ws.filter(|w| w.ws_col > 0 && w.ws_row > 0);
     let Some(ws) = ws else {
+        // TODO: the 80x24 fallback has no recorded source
         return (80, 24, None);
     };
     let (cols, rows) = (ws.ws_col as u32, ws.ws_row as u32);
@@ -166,6 +168,8 @@ fn window_size() -> (u32, u32, Option<CellSize>) {
     // a terminal that does not track pixels reports zeroes, and some report
     // a nonsense pair instead; anything that would imply a cell narrower
     // than 2px or shorter than 4px is one of those
+    //
+    // TODO: the 2px and 4px floors have no recorded source
     let cell = (xp >= 2 * cols && yp >= 4 * rows).then(|| CellSize {
         w: xp / cols,
         h: yp / rows,
@@ -217,14 +221,17 @@ fn protocol_from_env() -> Option<Protocol> {
 }
 
 fn query_protocol(probe: &mut query::Probe, budget: Duration) -> Protocol {
-    // XTVERSION (CSI > q) is not universally answered, so a device status
-    // request rides along behind it: its CSI 0 n reply marks the end of the
-    // exchange even when the version query drew nothing
+    // XTVERSION (CSI > q) is not universally answered, so a
+    // device status request follows it: the CSI 0 n reply
+    // marks the end of the exchange even when the version
+    // query drew nothing
     let reply = probe.ask(b"\x1b[>q\x1b[5n", budget, |b| {
         find(b, b"\x1b[0").is_some()
     });
 
     // ghostty answers with "libghostty", so these match as substrings
+    //
+    // TODO: Konsole's place in this list is unverified here
     for name in [&b"kitty"[..], b"ghostty", b"WezTerm", b"Konsole"] {
         if find(&reply, name).is_some() {
             return Protocol::Kitty;
@@ -303,8 +310,8 @@ mod tests {
 
     #[test]
     fn local_terminals_keep_the_budget_they_always_had() {
-        // sub-millisecond round trips must not scale down into a budget too
-        // tight for a terminal that answers in its own good time
+        // a sub-millisecond round trip must not scale the
+        // budget below the local ceiling
         let rtt = Duration::from_micros(200);
         assert_eq!(reply_budget(rtt, LOCAL_CEILING), LOCAL_CEILING);
         assert_eq!(reply_budget(rtt, REMOTE_CEILING), LOCAL_CEILING);
@@ -312,20 +319,19 @@ mod tests {
 
     #[test]
     fn a_slow_link_stretches_the_budget_but_not_past_the_ceiling() {
-        // a transatlantic hop: four round trips of headroom, room to spare
+        // 90ms round trip: 4 * 90ms, under the remote ceiling
         let atlantic = reply_budget(Duration::from_millis(90), REMOTE_CEILING);
         assert_eq!(atlantic, Duration::from_millis(360));
 
-        // and a bad one saturates rather than hanging for a second and a half
-        // per query
+        // 800ms round trip: 4 * 800ms clamps to the ceiling
         let awful = reply_budget(Duration::from_millis(800), REMOTE_CEILING);
         assert_eq!(awful, REMOTE_CEILING);
     }
 
     #[test]
     fn the_ceiling_only_lifts_for_a_link_worth_waiting_on() {
-        // guards the direction of the check: a local run must not inherit the
-        // remote ceiling and spend 1.5s discovering a terminal is unsuitable
+        // reply_ceiling only ever widens the wait, and only
+        // over ssh
         assert!(REMOTE_CEILING > LOCAL_CEILING);
     }
 }

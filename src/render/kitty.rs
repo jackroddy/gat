@@ -22,11 +22,22 @@ const PLACEMENT: u32 = 1;
 
 /// Where to take pixels from a stored image, and how large to draw them.
 pub struct Placement {
+    /// Left edge of the source rectangle, in image pixels.
     pub src_x: u32,
+
+    /// Top edge of the source rectangle, in image pixels.
     pub src_y: u32,
+
+    /// Width of the source rectangle, in image pixels.
     pub src_w: u32,
+
+    /// Height of the source rectangle, in image pixels.
     pub src_h: u32,
+
+    /// Width of the destination box, in terminal cells.
     pub cols: u32,
+
+    /// Height of the destination box, in terminal cells.
     pub rows: u32,
 }
 
@@ -36,17 +47,18 @@ pub fn write(out: &mut impl Write, fb: &Framebuffer, id: u32) -> io::Result<()> 
 }
 
 /// A framebuffer compressed and ready to be written out.
-//
-// kept separate from writing it because compressing a full-screen image takes
-// long enough to be worth doing off the main thread, where it does not stop
-// the viewer from drawing or from answering the keyboard
 pub struct Encoded {
+    /// Width of the image, in pixels.
     pub w: u32,
+
+    /// Height of the image, in pixels.
     pub h: u32,
+
+    // zlib, compressed on a worker thread
     payload: Vec<u8>,
 }
 
-/// Compress `fb`. Does no I/O, so this is the half a worker thread can do.
+/// Compress `fb` into the payload a transmission carries.
 pub fn encode(fb: &Framebuffer) -> io::Result<Encoded> {
     let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
     z.write_all(fb.as_raw())?;
@@ -58,23 +70,22 @@ pub fn encode(fb: &Framebuffer) -> io::Result<Encoded> {
 }
 
 fn send(out: &mut impl Write, fb: &Framebuffer, id: u32, display: bool) -> io::Result<()> {
-    // the one-shot path writes and exits with nobody left to read a reply, so
-    // it keeps asking for silence
+    // nothing reads the tty after the one-shot path writes,
+    // so an unread reply would land at the user's shell
     emit(out, &encode(fb)?, id, display, Quiet::Fully)
 }
 
-/// How much the terminal should say back about a transmission.
-//
-// q=2 suppresses successes and failures alike, which sounds tidy and means a
-// terminal that refuses an image -- too large, out of memory, protocol not
-// really supported -- refuses it silently, and the viewer shows an empty
-// screen with no way to find out why. Anything with a reader attached should
-// ask for the errors.
+/// How much the terminal reports back about a transmission.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Quiet {
-    /// q=2: say nothing, for a caller that will not be listening.
+    /// q=2: no reply at all.
+    //
+    // this suppresses failures as well as acknowledgements,
+    // so a refused image leaves an empty screen and no reason
+    // for it; only use it where nothing will read the reply
     Fully,
-    /// q=1: successes are noise, failures are not.
+
+    /// q=1: failures only.
     ErrorsOnly,
 }
 
@@ -102,8 +113,6 @@ pub fn emit(
     while let Some(chunk) = chunks.next() {
         let more = u8::from(chunks.peek().is_some());
         if first {
-            // f=32 RGBA, o=z zlib payload.
-            //
             // C=1 stops the terminal advancing the cursor itself. its
             // default, C=0, moves right by the placement's columns and down
             // by its rows, and the spec leaves the result undefined once
@@ -146,15 +155,6 @@ pub fn forget(out: &mut impl Write, id: u32) -> io::Result<()> {
 
 /// A fresh image id, distinct from those any other run of this program is
 /// likely to have used.
-//
-// kitty stores a transmitted image under its id and re-renders every
-// placement referring to that id when the data behind it changes. a counter
-// restarting at 1 each run therefore repaints the images earlier runs left
-// on screen, at the new image's size, which is how one image ends up drawn
-// over unrelated output further up the scrollback.
-//
-// seconds alone collide between two runs inside the same second and the pid
-// alone repeats within a boot, so mix both
 pub fn next_id() -> u32 {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -163,6 +163,17 @@ pub fn next_id() -> u32 {
     static BASE: OnceLock<u32> = OnceLock::new();
     static N: AtomicU32 = AtomicU32::new(0);
 
+    // kitty stores a transmitted image under its id and
+    // re-renders every placement referring to that id when the
+    // data behind it changes, so a counter restarting at 1 each
+    // run repaints the images earlier runs left on screen, at
+    // the new image's size
+    //
+    // seconds alone collide between two runs inside the same
+    // second and the pid alone repeats within a boot, so mix
+    // both
+    //
+    // TODO: where do the rotation distances 11 and 19 come from?
     let base = *BASE.get_or_init(|| {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -172,7 +183,7 @@ pub fn next_id() -> u32 {
             ^ std::process::id().rotate_left(19)
     });
 
-    // id 0 means "unspecified" to the terminal, so never hand it out
+    // id 0 means "unspecified" to the terminal
     match base.wrapping_add(N.fetch_add(1, Ordering::Relaxed)) {
         0 => 1,
         id => id,
@@ -201,8 +212,8 @@ mod tests {
 
     #[test]
     fn payload_round_trips_to_the_original_pixels() {
-        // 40x40 is large enough to need several chunks once the gradient
-        // defeats the compressor
+        // 40x40 is large enough to need several chunks once
+        // the gradient makes the payload incompressible
         let fb = Framebuffer::from_fn(40, 40, |x, y| {
             image::Rgba([x as u8, y as u8, (x * y) as u8, 255])
         });

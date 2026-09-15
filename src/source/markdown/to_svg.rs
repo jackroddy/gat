@@ -1,9 +1,4 @@
 //! Turning a laid-out page into an SVG document.
-//
-// This is the replaceable half. Layout produces positions and styles in
-// pixels; everything that knows about XML, usvg quirks or escaping lives here,
-// so swapping resvg for a glyph rasterizer later means rewriting this file and
-// nothing else.
 
 use std::fmt::Write;
 
@@ -11,19 +6,13 @@ use super::font;
 use super::layout::{Item, Page, Rgb};
 
 /// Render the slice of `page` from `from_y` for `h` pixels.
-//
-// only the items that fall in the band are emitted, and the band is drawn at
-// the origin. that keeps both the SVG parse and the rasterize proportional to
-// what is on screen rather than to the length of the document, which is the
-// whole point of drawing a band at a time.
 pub fn emit(page: &Page, bg: Rgb, from_y: f32, h: f32) -> String {
     let mut s = String::with_capacity(page.items.len() * 96 + 512);
 
-    // xml:space, because usvg implements SVG's whitespace collapsing and would
-    // otherwise strip the indentation off every line of every code block.
-    // font-kerning, because layout positions each run by multiplying columns
-    // by one fixed advance, and a kern pair would put the glyphs somewhere
-    // that arithmetic does not predict
+    // xml:space: usvg collapses whitespace and would strip the
+    // indentation off every line of every code block.
+    // font-kerning: layout positions each run by multiplying
+    // columns by one fixed advance, off which a kern pair moves
     let _ = write!(
         s,
         "<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}' \
@@ -38,6 +27,8 @@ pub fn emit(page: &Page, bg: Rgb, from_y: f32, h: f32) -> String {
     );
 
     for item in &page.items {
+        // the SVG parse and the rasterize then cost what is on
+        // screen rather than the length of the document
         if !visible(item, from_y, h) {
             continue;
         }
@@ -79,14 +70,14 @@ pub fn emit(page: &Page, bg: Rgb, from_y: f32, h: f32) -> String {
 }
 
 /// Whether `item` puts any ink inside the band starting at `from_y`.
-//
-// a run is positioned by its baseline, so its ink reaches roughly one em above
-// and a third below. Being generous here costs one clipped glyph's worth of
-// work and avoids the opposite mistake, which is a line vanishing from the top
-// or bottom edge of every band.
 fn visible(item: &Item, from_y: f32, h: f32) -> bool {
     let (top, bottom) = match item {
         Item::Rect { y, h, .. } => (*y, y + h),
+
+        // a run is positioned by its baseline; its ink reaches
+        // 1.2 em above it and 0.4 em below
+        //
+        // TODO: both eyeballed, not read from the font metrics
         Item::Run { baseline, size, .. } => (baseline - size * 1.2, baseline + size * 0.4),
     };
     bottom >= from_y && top <= from_y + h
@@ -98,12 +89,6 @@ fn hex(c: Rgb) -> String {
 
 /// Escape `s` for use as XML character data, dropping anything XML 1.0
 /// forbids outright.
-//
-// the dropping matters as much as the escaping. XML 1.0 permits almost no C0
-// control characters, and roxmltree rejects the whole document over a single
-// stray one, so a form feed sitting in a source file would turn into a parse
-// error rather than a page with an odd character on it. markdown is written by
-// hand and pasted into, so these do turn up
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 16);
     for c in s.chars() {
@@ -113,8 +98,10 @@ pub fn escape(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\t' | '\n' | '\r' => out.push(c),
-            // C0 apart from the three above, DEL and the C1 block, and the two
-            // noncharacters XML names explicitly
+
+            // XML 1.0 permits almost no C0, and roxmltree
+            // rejects a whole document over one stray control
+            // character, so these are dropped, not escaped
             c if (c as u32) < 0x20 => {}
             c if ('\u{7f}'..='\u{9f}').contains(&c) => {}
             '\u{fffe}' | '\u{ffff}' => {}
@@ -136,11 +123,11 @@ mod tests {
 
     #[test]
     fn characters_xml_forbids_are_dropped_not_escaped() {
-        // a form feed has no escape that XML 1.0 accepts; emitting one as
-        // &#12; is just as fatal as emitting it raw, so it has to go
+        // &#12; is as fatal to XML 1.0 as the raw form feed
         assert_eq!(escape("page\u{c}break"), "pagebreak");
         assert_eq!(escape("nul\0byte"), "nulbyte");
-        // tab and newline are the C0 characters XML does allow
+
+        // tab, newline and CR are the C0 characters XML allows
         assert_eq!(escape("a\tb\nc"), "a\tb\nc");
     }
 

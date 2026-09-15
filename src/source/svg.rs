@@ -9,22 +9,22 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Framebuffer, Error> {
         .map_err(|e| Error::Decode(e.to_string()))?;
 
     let size = tree.size();
+
     // SVG has no pixel size of its own, so rasterize straight at the size
     // it will be displayed at rather than scaling a bitmap afterwards
     let scale = (hints.max_w as f32 / size.width())
         .min(hints.max_h as f32 / size.height())
+        // a zero-size tree gives scale 0 and a 0x0 pixmap
         .max(f32::MIN_POSITIVE);
 
     rasterize(&tree, scale)
 }
 
 /// Draw `tree` at `scale` into a straight-alpha framebuffer.
-//
-// split out from load because the contain-fit above is a policy, not a fact
-// about rasterizing, and markdown needs a different one: it lays itself out at
-// the display width already, so scaling it again to fit the screen height
-// would shrink a long document until the text was unreadable
 pub fn rasterize(tree: &usvg::Tree, scale: f32) -> Result<Framebuffer, Error> {
+    // the scale is the caller's: markdown lays itself out
+    // at the display width already, where an svg gets the
+    // contain-fit above
     let size = tree.size();
     let (w, h) = (
         (size.width() * scale).round().max(1.0) as u32,
@@ -46,6 +46,7 @@ pub fn rasterize(tree: &usvg::Tree, scale: f32) -> Result<Framebuffer, Error> {
         let a = px[3] as u32;
         if a != 0 && a != 255 {
             for c in &mut px[..3] {
+                // c_straight = round(c_pre * 255 / a)
                 *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
             }
         }

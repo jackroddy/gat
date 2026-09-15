@@ -1,45 +1,35 @@
 //! The one font family the markdown renderer draws with, compiled in.
 //
-// resvg resolves font names through a fontdb, and usvg's default Options
-// carries an empty one. Worse, usvg declares fontdb with default-features off,
-// which compiles out load_system_fonts, load_font_file and load_fonts_dir
-// alike, leaving load_font_data as the only way in. So the bytes have to come
-// from here. src/source/pdf/via_hayro.rs does the same thing for the base-14
-// PDF fonts, for the same reason.
-//
-// Shipping the font rather than borrowing the system's also settles the
-// advance ratio below. Monospace layout is arithmetic over that one number,
-// and a number that describes a font we chose is a fact, whereas one that
-// describes whatever `monospace` happened to resolve to is a guess.
+// usvg's default Options carries an empty fontdb, and declares
+// fontdb with default-features off, compiling out
+// load_system_fonts, load_font_file and load_fonts_dir, so
+// load_font_data is the only way in
 
 use resvg::usvg;
 
 /// Liberation Mono, SIL OFL 1.1. License text sits beside the files.
 //
-// not JetBrains Mono, whose 600/1000 advance is tidier: its GSUB carries
-// `calt`, which is how it implements coding ligatures, and harfrust applies
-// calt by default. `->` and `!=` would each shape to a single glyph, so a code
-// block would draw narrower than the column arithmetic believes it is.
-// Liberation Mono carries only `dlig`, which no shaper applies unasked.
+// not JetBrains Mono: its GSUB carries `calt`, which harfrust
+// applies by default, so `->` would shape to one glyph and a
+// code block would draw narrower than the column arithmetic
+// predicts. Liberation Mono carries only `dlig`
 const REGULAR: &[u8] = include_bytes!("../../../assets/fonts/LiberationMono-Regular.ttf");
 const BOLD: &[u8] = include_bytes!("../../../assets/fonts/LiberationMono-Bold.ttf");
 const ITALIC: &[u8] = include_bytes!("../../../assets/fonts/LiberationMono-Italic.ttf");
 const BOLD_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/LiberationMono-BoldItalic.ttf");
 
-/// The family name the faces above register under, and that the generated SVG
-/// asks for by name.
+/// The family name the faces register under, and that the
+/// generated SVG asks for.
 pub const FAMILY: &str = "Liberation Mono";
 
-/// Advance width as a fraction of the em, from the font's own hmtx: 1229 over
-/// a 2048 unit em. Every column-to-pixel conversion goes through this.
+/// Advance width as a fraction of the em, from the font's own
+/// hmtx: 1229 over a 2048 unit em.
 pub const ADVANCE_RATIO: f32 = 1229.0 / 2048.0;
 
-/// Ascent as a fraction of the em, from hhea. Layout places a line's box and
-/// then drops the baseline this far into it.
+/// Ascent as a fraction of the em, from hhea.
 pub const ASCENT: f32 = 1705.0 / 2048.0;
 
-/// Options with the four faces loaded and the family set as the default, so
-/// unstyled text still lands on a real font rather than on nothing.
+/// Options with the four faces loaded and the family set as the default.
 pub fn options() -> usvg::Options<'static> {
     let mut opt = usvg::Options {
         font_family: FAMILY.to_owned(),
@@ -59,16 +49,14 @@ mod tests {
 
     #[test]
     fn every_face_loads() {
-        // a face that fails to parse is not an error, it is a silently empty
-        // page, so check the db actually took all four
+        // a face that fails to parse gives a blank page, not an error
         let opt = options();
         assert_eq!(opt.fontdb.len(), 4);
     }
 
     #[test]
     fn the_family_resolves() {
-        // the generated SVG asks for FAMILY by name; if the name in the font
-        // does not match the one we emit, text renders blank
+        // text renders blank if the font's name is not FAMILY
         let opt = options();
         let query = usvg::fontdb::Query {
             families: &[usvg::fontdb::Family::Name(FAMILY)],
