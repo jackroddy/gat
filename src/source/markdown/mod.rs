@@ -36,9 +36,59 @@ const MAX_SIZE: f32 = 40.0;
 // 16 megapixels is 64MB of framebuffer
 const MAX_PIXELS: u32 = 16_000_000;
 
-pub fn load(bytes: &[u8], hints: Hints) -> Result<Loaded, Error> {
-    let text = String::from_utf8_lossy(bytes);
+/// The largest piece of a page to hand over at once, in pixels.
+//
+// the one-shot render stacks pieces down the scrollback, so a
+// long document costs several images rather than one enormous
+// one. Each is transmitted once and then sits in the scrollback,
+// so splitting costs the terminal nothing it would not have paid
+// for the whole page
+const CHUNK_PIXELS: u32 = 4_000_000;
 
+/// A document rendered in pieces, top to bottom.
+pub struct Chunks {
+    page: layout::Page,
+    bg: layout::Rgb,
+    total_h: f32,
+    chunk_h: f32,
+    y: f32,
+}
+
+/// Lay `bytes` out and return its pieces, without drawing any.
+pub fn chunks(bytes: &[u8], hints: Hints) -> Result<Chunks, Error> {
+    let (page, theme, width) = lay_out(bytes, hints);
+    let total_h = drawn_height(page.h, width, hints);
+
+    // whole lines only, or a seam slices the glyphs on it
+    let line_h = (theme.base_size * theme.line_ratio).max(1.0);
+    let rows = ((CHUNK_PIXELS as f32 / width.max(1.0)) / line_h).floor().max(1.0);
+
+    Ok(Chunks {
+        page,
+        bg: theme.bg,
+        total_h,
+        chunk_h: rows * line_h,
+        y: 0.0,
+    })
+}
+
+impl Iterator for Chunks {
+    type Item = Result<Framebuffer, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.y >= self.total_h {
+            return None;
+        }
+        let h = self.chunk_h.min(self.total_h - self.y);
+        let piece = draw(&self.page, self.bg, self.y, h);
+        self.y += h;
+        Some(piece)
+    }
+}
+
+/// Parse and lay out, stopping before anything is drawn.
+fn lay_out(bytes: &[u8], hints: Hints) -> (layout::Page, layout::Theme, f32) {
+    let text = String::from_utf8_lossy(bytes);
     let theme = theme_for(hints.cell);
 
     // only as wide as the measure needs, so the page is no
@@ -47,19 +97,22 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Loaded, Error> {
     let width = measure.min(hints.max_w.max(1) as f32).max(1.0);
 
     let page = layout::layout(&parse::parse(&text), &theme, width);
+    (page, theme, width)
+}
 
-    // the whole document is drawn, not a screenful: the
-    // viewer scrolls by cropping this buffer, and cropping
-    // costs a memcpy where drawing again costs a rasterize
-    let total_h = drawn_height(page.h, width, hints);
-
-    let svg_doc = to_svg::emit(&page, theme.bg, 0.0, total_h);
+/// Rasterize the slice of `page` from `from_y` for `h` pixels.
+fn draw(page: &layout::Page, bg: layout::Rgb, from_y: f32, h: f32) -> Result<Framebuffer, Error> {
+    let svg_doc = to_svg::emit(page, bg, from_y, h);
     let tree = usvg::Tree::from_str(&svg_doc, &font::options())
         .map_err(|e| Error::Decode(e.to_string()))?;
+    Ok(crop(svg::rasterize(&tree, 1.0)?, h as u32, bg))
+}
 
-    let fb = svg::rasterize(&tree, 1.0)?;
+pub fn load(bytes: &[u8], hints: Hints) -> Result<Loaded, Error> {
+    let (page, _, width) = lay_out(bytes, hints);
+    let total_h = drawn_height(page.h, width, hints);
     Ok(Loaded {
-        fb: crop(fb, total_h as u32, theme.bg),
+        fb: draw(&page, layout::Theme::DARK.bg, 0.0, total_h)?,
     })
 }
 
@@ -150,6 +203,7 @@ mod tests {
             "the page was cut to the viewport instead of drawn whole"
         );
     }
+
 
     #[test]
     fn a_page_renders_actual_pixels() {

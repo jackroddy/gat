@@ -90,27 +90,45 @@ fn show(
     background: [u8; 3],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
+    let flowed = source::kind(&bytes, path) == source::Kind::Document;
     let hints = source::Hints {
         max_w: budget.cols * budget.cell.w,
-        max_h: budget.rows * budget.cell.h,
+        // a document is written into the scrollback in pieces, so
+        // it is not cut off at the fold the way a page with an
+        // edge of its own would be
+        max_h: if flowed {
+            u32::MAX
+        } else {
+            budget.rows * budget.cell.h
+        },
         cell: budget.cell,
     };
-    let decoded = source::load(&bytes, path, hints)?.fb;
 
-    let (w, h) = geometry::fit(decoded.width(), decoded.height(), budget);
-    let mut fb = framebuffer::resize(&decoded, w, h);
-    framebuffer::flatten_onto(&mut fb, background);
+    for piece in source::pieces(&bytes, path, hints)? {
+        let decoded = piece?;
 
-    render::kitty::write(out, &fb, render::kitty::next_id())?;
+        // a picture is fitted to the screen; a document was laid
+        // out at the terminal's own text size and fitting it
+        // would undo that
+        let mut fb = if flowed {
+            decoded
+        } else {
+            let (w, h) = geometry::fit(decoded.width(), decoded.height(), budget);
+            framebuffer::resize(&decoded, w, h)
+        };
+        framebuffer::flatten_onto(&mut fb, background);
 
-    // the renderer sets C=1, so the cursor is still at the
-    // image's top left corner and the next output would
-    // land on top of it
-    let rows = h.div_ceil(budget.cell.h);
-    for _ in 0..rows {
-        out.write_all(b"\n")?;
+        let rows = fb.height().div_ceil(budget.cell.h);
+        render::kitty::write(out, &fb, render::kitty::next_id())?;
+
+        // the renderer sets C=1, so the cursor is still at the
+        // image's top left corner and the next output would
+        // land on top of it
+        for _ in 0..rows {
+            out.write_all(b"\n")?;
+        }
+        out.write_all(b"\r")?;
     }
-    out.write_all(b"\r")?;
     Ok(())
 }
 

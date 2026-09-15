@@ -31,6 +31,47 @@ pub struct Loaded {
     pub fb: Framebuffer,
 }
 
+/// A source as one or more images, stacked top to bottom.
+//
+// a picture is one piece and always has been. a document can be
+// several, because stacking them down the scrollback beats
+// handing a terminal a single image it may not take, and beats
+// cutting the document off at the fold
+pub struct Pieces {
+    inner: Inner,
+}
+
+enum Inner {
+    Whole(Option<Framebuffer>),
+    #[cfg(feature = "markdown")]
+    Flowed(markdown::Chunks),
+}
+
+impl Iterator for Pieces {
+    type Item = Result<Framebuffer, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            Inner::Whole(fb) => fb.take().map(Ok),
+            #[cfg(feature = "markdown")]
+            Inner::Flowed(chunks) => chunks.next(),
+        }
+    }
+}
+
+/// Decode `bytes` as the pieces it should be drawn in.
+pub fn pieces(bytes: &[u8], path: &Path, hints: Hints) -> Result<Pieces, Error> {
+    #[cfg(feature = "markdown")]
+    if matches!(sniff(bytes, path), Format::Markdown) {
+        return Ok(Pieces {
+            inner: Inner::Flowed(markdown::chunks(bytes, hints)?),
+        });
+    }
+    Ok(Pieces {
+        inner: Inner::Whole(Some(load(bytes, path, hints)?.fb)),
+    })
+}
+
 /// Whether a source is a picture or a page of text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
