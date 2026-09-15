@@ -6,6 +6,8 @@ authors = ["Jack Roddy <jack.w.roddy@gmail.com>"]
 repository = "https://github.com/jackroddy/gat"
 license = "MIT OR Apache-2.0"
 description = "graphics at terminal"
+readme = "README.md"
+exclude = ["CLAUDE.md"]
 
 [dependencies]
 lexopt = "0.3"
