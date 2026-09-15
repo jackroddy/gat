@@ -37,19 +37,18 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Loaded, Error> {
     let theme = theme_for(width);
     let page = layout::layout(&parse::parse(&text), &theme, width);
 
-    // laying the whole document out costs a few hundred
-    // microseconds; only the requested band is drawn
-    let total_h = page.h.max(1.0);
-    let from_y = (hints.from_y as f32).min((total_h - 1.0).max(0.0));
-    let band_h = band_height(total_h - from_y, hints);
+    // the whole document is drawn, not a screenful: the
+    // viewer scrolls by cropping this buffer, and cropping
+    // costs a memcpy where drawing again costs a rasterize
+    let total_h = drawn_height(page.h, hints);
 
-    let svg_doc = to_svg::emit(&page, theme.bg, from_y, band_h);
+    let svg_doc = to_svg::emit(&page, theme.bg, 0.0, total_h);
     let tree = usvg::Tree::from_str(&svg_doc, &font::options())
         .map_err(|e| Error::Decode(e.to_string()))?;
 
     let fb = svg::rasterize(&tree, 1.0)?;
     Ok(Loaded {
-        fb: crop(fb, band_h as u32, theme.bg),
+        fb: crop(fb, total_h as u32, theme.bg),
         total_h: total_h as u32,
     })
 }
@@ -70,14 +69,15 @@ fn theme_for(width: f32) -> layout::Theme {
     }
 }
 
-/// How tall a band to draw, given how much document is left below `from_y`.
-fn band_height(remaining: f32, hints: Hints) -> f32 {
-    // never more than was asked for: geometry::fit shrinks by
-    // min(w_frac, h_frac), so a band taller than the screen
-    // would be scaled down and the text would lose resolution
+/// How tall a page to draw, given how tall the content is.
+fn drawn_height(content_h: f32, hints: Hints) -> f32 {
+    // the one-shot render asks for a screenful and gets one,
+    // since geometry::fit would otherwise shrink a long page
+    // until the text lost resolution. the viewer asks for the
+    // document and crops it as the reader scrolls
     let by_request = hints.max_h.max(1) as f32;
     let by_memory = (MAX_PIXELS / hints.max_w.max(1)) as f32;
-    remaining.min(by_request).min(by_memory).max(1.0)
+    content_h.min(by_request).min(by_memory).max(1.0)
 }
 
 /// Cut the page down to `h`, or pad it out if the content fell short.
@@ -101,57 +101,41 @@ mod tests {
         Hints {
             max_w: w,
             max_h: h,
-            from_y: 0,
         }
     }
 
     #[test]
-    fn a_band_is_never_taller_than_was_asked_for() {
-        assert_eq!(band_height(6000.0, hints(800, 600)), 600.0);
-        assert_eq!(band_height(200.0, hints(800, 600)), 200.0);
+    fn a_page_is_drawn_to_the_height_asked_for() {
+        // the one-shot render gets a screenful
+        assert_eq!(drawn_height(6000.0, hints(800, 600)), 600.0);
+        assert_eq!(drawn_height(200.0, hints(800, 600)), 200.0);
+        // the viewer asks for the document and gets all of it
+        assert_eq!(drawn_height(6000.0, hints(800, u32::MAX)), 6000.0);
     }
 
     #[test]
     fn the_pixel_ceiling_overrides_a_generous_caller() {
-        let h = band_height(f32::MAX, hints(8000, 100_000));
+        let h = drawn_height(f32::MAX, hints(8000, 100_000));
         assert_eq!(h, (MAX_PIXELS / 8000) as f32);
     }
 
     #[test]
-    fn a_band_lower_down_the_document_renders_different_text() {
+    fn a_long_document_comes_back_whole() {
+        // the viewer scrolls by cropping this buffer, so the
+        // buffer has to hold every line, not one screenful
         let md = "# Heading\n\n".to_owned() + &"A paragraph of body text. ".repeat(400);
-        let top = load(md.as_bytes(), hints(800, 400)).unwrap();
-        let down = load(
-            md.as_bytes(),
-            Hints {
-                from_y: 2000,
-                ..hints(800, 400)
-            },
-        )
-        .unwrap();
+        let got = load(md.as_bytes(), hints(800, u32::MAX)).unwrap();
 
-        assert_eq!(top.total_h, down.total_h, "the document did not change");
-        assert!(top.total_h > 2400, "test document is too short to band");
-        assert_eq!(top.fb.height(), 400);
-        assert_ne!(
-            top.fb.as_raw(),
-            down.fb.as_raw(),
-            "two different bands rendered identical pixels"
+        assert!(got.total_h > 2400, "test document is too short to matter");
+        assert_eq!(
+            got.fb.height(),
+            got.total_h,
+            "the buffer is shorter than the document it reports"
         );
-    }
-
-    #[test]
-    fn asking_past_the_end_still_returns_a_band() {
-        // clamping rather than erroring: a resize can leave an
-        // offset pointing past a document that just got shorter
-        let got = load(
-            b"# short\n",
-            Hints {
-                from_y: 99_999,
-                ..hints(800, 400)
-            },
+        assert!(
+            got.fb.height() > 400,
+            "the page was cut to the viewport instead of drawn whole"
         );
-        assert!(got.is_ok(), "an offset past the end should clamp, not fail");
     }
 
     #[test]

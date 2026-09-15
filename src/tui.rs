@@ -1,6 +1,6 @@
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::framebuffer::{self, Framebuffer};
@@ -39,15 +39,26 @@ const ZOOM_HEADROOM: u32 = 2;
 // scrolling costs a placement, not a re-render
 //
 // TODO: 1.6 is eyeballed
-const BAND: f32 = 1.6;
+const BAND: f32 = 1.75;
 
 /// The smallest band, as a multiple of the viewport height.
 //
 // no terminal reports its limit, so start generous and halve
-// on refusal; the floor stops an endless retry loop
+// on refusal. one screenful is the floor because a band that
+// does not cover the screen cannot fill it, and because it is
+// the size the one-shot path sends and is known to be taken
 //
 // TODO: 0.35 is eyeballed
-const BAND_FLOOR: f32 = 0.35;
+const BAND_FLOOR: f32 = 1.0;
+
+/// How much of the band's margin may be used up before the
+/// next one is cut, as a fraction of the margin.
+//
+// cutting and compressing a band takes tens of milliseconds,
+// which is a visible stutter if it happens under the keypress
+// that needed it. starting early enough that the work finishes
+// before the reader arrives is what keeps scrolling free
+const PREFETCH_AT: f64 = 0.35;
 
 // TODO: the zoom range and the key steps below are eyeballed;
 //       no measurement or reference is behind them
@@ -92,13 +103,23 @@ impl Drop for Screen {
 }
 
 struct Shown {
-    /// The pixels on hand. For a document this is one band of it, not all.
-    image: Framebuffer,
+    /// The whole rasterized page, or the whole image.
+    //
+    // scrolling a document crops this rather than drawing the
+    // page again: a crop is a memcpy, a redraw is a rasterize.
+    // shared so a worker can cut the next band without copying
+    image: Arc<Framebuffer>,
+
+    /// The id of the slice the terminal is holding.
     id: u32,
+
     kind: source::Kind,
 
-    /// Where `image` starts in the document; 0 for an image.
+    /// The first row of `image` the terminal holds.
     band_y: u32,
+
+    /// How many rows of `image` the terminal holds.
+    band_h: u32,
 
     /// The full height of the document, or of the image itself.
     doc_h: u32,
@@ -149,15 +170,10 @@ const PATIENCE: Duration = Duration::from_millis(120);
 
 /// A decode running on a worker thread.
 struct Loading {
-    done: mpsc::Receiver<Result<Ready, String>>,
+    done: mpsc::Receiver<Result<Shown, String>>,
     began: Instant,
 }
 
-/// A decoded framebuffer together with its compressed form.
-struct Ready {
-    shown: Shown,
-    encoded: kitty::Encoded,
-}
 
 enum Key {
     Quit,
@@ -196,9 +212,9 @@ fn event_loop(
     let mut band = BAND;
 
     // the top of the band to render next; 0 for an image
-    let mut wanted_y = 0u32;
     let mut dirty = true;
     let mut loading: Option<Loading> = None;
+    let mut prefetch: Option<Prefetch> = None;
 
     loop {
         if load_wanted {
@@ -207,14 +223,8 @@ fn event_loop(
 
             // replacing the job drops the receiver, so a
             // superseded worker's result is discarded
-            loading = Some(spawn_load(
-                files[index].clone(),
-                cells,
-                cell,
-                background,
-                wanted_y,
-                band,
-            ));
+            prefetch = None;
+            loading = Some(spawn_load(files[index].clone(), cells, cell, background));
         }
 
         if let Some(job) = &loading {
@@ -222,17 +232,10 @@ fn event_loop(
                 Ok(result) => {
                     loading = None;
                     match result {
-                        Ok(Ready {
-                            shown: mut fresh,
-                            encoded,
-                        }) => {
-                            fresh.id = kitty::next_id();
-                            kitty::emit(out, &encoded, fresh.id, false, kitty::Quiet::ErrorsOnly)?;
-
-                            // a band fetched mid-scroll keeps the view
-                            if fresh.band_y == 0 && shown.is_none() {
-                                view = View::reset(&fresh, cells, cell);
-                            }
+                        Ok(mut fresh) => {
+                            fresh.band_h = first_band(&fresh, cells, cell, band);
+                            view = View::reset(&fresh, cells, cell);
+                            send_band(out, &mut fresh, 0)?;
 
                             // place the new image before dropping the old one,
                             // so the screen never shows the gap between them
@@ -262,14 +265,50 @@ fn event_loop(
             }
         }
 
-        // request only when nothing is already on the way, or
-        // a fast scroll queues one request per keypress
-        if loading.is_none()
-            && let Some(s) = &shown
-            && let Some(want) = needed_band(s, &view, cells, cell)
+        // a band cut ahead of time arrives here; emitting it is
+        // all that is left to do under the keypress
+        if let Some(job) = &prefetch
+            && let Ok(result) = job.done.try_recv()
         {
-            wanted_y = want;
-            load_wanted = true;
+            let at = job.at;
+            prefetch = None;
+            match (result, shown.as_mut()) {
+                (Ok(encoded), Some(s)) => {
+                    let stale = s.id;
+                    s.id = kitty::next_id();
+                    s.band_y = at;
+                    s.band_h = encoded.h;
+                    kitty::emit(out, &encoded, s.id, false, kitty::Quiet::ErrorsOnly)?;
+                    kitty::forget(out, stale)?;
+                    dirty = true;
+                }
+                (Err(e), _) => {
+                    failure = Some(e);
+                    dirty = true;
+                }
+                _ => {}
+            }
+        }
+
+        // the page is already rasterized, so moving off the
+        // transmitted slice costs a crop and a compress rather
+        // than another render, and starting it early enough
+        // keeps that off the keypress that needs it
+        if let Some(s) = &shown
+            && prefetch.is_none()
+        {
+            // the hard case first: the view has already left the
+            // slice, so there is nothing to hide the work behind
+            if let Some(want) = needed_band(s, &view, cells, cell) {
+                let s = shown.as_mut().unwrap();
+                let stale = s.id;
+                send_band(out, s, want)?;
+                kitty::forget(out, stale)?;
+                dirty = true;
+            } else if let Some(want) = band_wanted(s, &view, cells, cell, PREFETCH_AT) {
+                let h = s.band_h.min(s.doc_h.saturating_sub(want)).max(1);
+                prefetch = Some(spawn_band(Arc::clone(&s.image), want, h));
+            }
         }
 
         if dirty {
@@ -285,6 +324,10 @@ fn event_loop(
                 SPIN_TICK
             }
             Some(_) => SPIN_TICK,
+            // a band cut in the background is worth collecting
+            // promptly; waiting out a TICK for it would put the
+            // delay back that cutting it early removed
+            None if prefetch.is_some() => SPIN_TICK,
             None => TICK,
         };
 
@@ -300,12 +343,17 @@ fn event_loop(
 
         // a refusal arrives as an APC mixed in with the keys
         if let Some(complaint) = graphics_error(&input) {
-            // a refusal is usually about size, so halve the
-            // band and retry rather than showing nothing
-            if band > BAND_FLOOR && shown.as_ref().is_some_and(|s| s.kind == source::Kind::Document)
-            {
+            // a refusal is usually about size, so halve the band
+            // and cut a smaller one. the page itself is already
+            // in hand, so this costs a crop rather than a reload
+            let shrinkable =
+                band > BAND_FLOOR && shown.as_ref().is_some_and(|s| s.kind == source::Kind::Document);
+            if shrinkable {
                 band = (band * 0.5).max(BAND_FLOOR);
-                load_wanted = true;
+                prefetch = None;
+                let s = shown.as_mut().unwrap();
+                s.band_h = band_rows(cells, cell, band).min(s.doc_h).max(1);
+                send_band(out, s, s.band_y)?;
                 failure = Some(format!("{complaint}; retrying with a smaller page"));
             } else {
                 failure = Some(complaint);
@@ -318,12 +366,10 @@ fn event_loop(
                 Key::Quit => return Ok(()),
                 Key::Next if index + 1 < files.len() => {
                     index += 1;
-                    wanted_y = 0;
                     load_wanted = true;
                 }
                 Key::Prev if index > 0 => {
                     index -= 1;
-                    wanted_y = 0;
                     load_wanted = true;
                 }
                 Key::Next | Key::Prev => {}
@@ -378,6 +424,21 @@ fn placement(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Place
 
 /// The band this view needs, when the one on hand does not reach it.
 fn needed_band(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Option<u32> {
+    // the whole margin is gone: the view has left the slice the
+    // terminal holds, so this band cannot wait for a worker
+    band_wanted(s, view, cells, cell, 1.0)
+}
+
+/// Where the next band should start, once `spent` of the margin
+/// on either side has been used. `spent` of 1.0 means the view
+/// has reached the edge of what the terminal holds.
+fn band_wanted(
+    s: &Shown,
+    view: &View,
+    cells: (u32, u32),
+    cell: CellSize,
+    spent: f64,
+) -> Option<u32> {
     if s.kind != source::Kind::Document {
         return None;
     }
@@ -385,11 +446,7 @@ fn needed_band(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Opt
     let band_y = s.band_y as f64;
     let slack = ((g.band_h - g.src_h) / 2.0).max(0.0);
 
-    // request while a quarter of the margin is left, so the
-    // new pixels usually arrive before the reader needs them
-    //
-    // TODO: 0.25 is eyeballed
-    let trigger = slack * 0.25;
+    let trigger = slack * (1.0 - spent);
 
     let above = g.doc_top - band_y;
     let below = (band_y + g.band_h) - (g.doc_top + g.src_h);
@@ -419,7 +476,7 @@ struct Geom {
 
 fn geom(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Geom {
     let img_w = s.image.width().max(1) as f64;
-    let band_h = s.image.height().max(1) as f64;
+    let band_h = s.band_h.max(1) as f64;
     let doc_h = s.doc_h.max(1) as f64;
     let (cols, rows) = (cells.0.max(1), cells.1.saturating_sub(1).max(1));
     let view_w = (cols * cell.w) as f64;
@@ -494,8 +551,6 @@ fn load(
     cells: (u32, u32),
     cell: CellSize,
     background: [u8; 3],
-    from_y: u32,
-    band: f32,
 ) -> Result<Shown, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
     let kind = source::kind(&bytes, path);
@@ -509,11 +564,11 @@ fn load(
     let hints = source::Hints {
         max_w: cells.0 * cell.w * headroom,
         max_h: match kind {
-            // a band, not the document: see BAND
-            source::Kind::Document => (cells.1 as f32 * cell.h as f32 * band).max(1.0) as u32,
+            // the whole document, because scrolling crops this
+            // buffer rather than drawing the page again
+            source::Kind::Document => u32::MAX,
             source::Kind::Image => cells.1 * cell.h * headroom,
         },
-        from_y,
     };
     let source::Loaded { fb: decoded, total_h } = source::load(&bytes, path, hints)?;
 
@@ -537,34 +592,78 @@ fn load(
     };
     framebuffer::flatten_onto(&mut fb, background);
     Ok(Shown {
-        image: fb,
+        image: Arc::new(fb),
         id: 0,
         kind,
-        band_y: from_y,
+        band_y: 0,
+        band_h: 0,
         doc_h: total_h,
     })
 }
 
-/// Decode and compress `path` on a worker thread.
+/// A band being cut and compressed on a worker thread.
+struct Prefetch {
+    at: u32,
+    done: mpsc::Receiver<Result<kitty::Encoded, String>>,
+}
+
+/// Cut and compress the band at `y` without blocking the loop.
+fn spawn_band(image: Arc<Framebuffer>, y: u32, h: u32) -> Prefetch {
+    let (tx, done) = mpsc::channel();
+    std::thread::spawn(move || {
+        let band = crop_band(&image, y, h);
+        let _ = tx.send(kitty::encode(&band).map_err(|e| e.to_string()));
+    });
+    Prefetch { at: y, done }
+}
+
+fn crop_band(image: &Framebuffer, y: u32, h: u32) -> Framebuffer {
+    if y == 0 && h == image.height() {
+        return image.clone();
+    }
+    image::imageops::crop_imm(image, 0, y, image.width(), h).to_image()
+}
+
+/// How many rows of a freshly loaded page to hand the terminal.
+fn first_band(s: &Shown, cells: (u32, u32), cell: CellSize, band: f32) -> u32 {
+    match s.kind {
+        // an image goes over whole; zooming needs all of it
+        source::Kind::Image => s.image.height(),
+        source::Kind::Document => band_rows(cells, cell, band).min(s.doc_h).max(1),
+    }
+}
+
+fn band_rows(cells: (u32, u32), cell: CellSize, band: f32) -> u32 {
+    (cells.1 as f32 * cell.h as f32 * band).max(1.0) as u32
+}
+
+/// Cut the slice starting at `y` out of the page and transmit it.
+//
+// this is the whole scrolling cost: a crop and a compress of
+// one screenful, against a parse, a layout and a rasterize of
+// the document if the page were drawn again instead
+fn send_band(out: &mut impl Write, s: &mut Shown, y: u32) -> std::io::Result<()> {
+    let h = s.band_h.min(s.doc_h.saturating_sub(y)).max(1);
+    let y = y.min(s.doc_h.saturating_sub(h));
+
+    let band = crop_band(&s.image, y, h);
+
+    s.id = kitty::next_id();
+    s.band_y = y;
+    s.band_h = h;
+    kitty::emit(out, &kitty::encode(&band)?, s.id, false, kitty::Quiet::ErrorsOnly)
+}
+
+/// Rasterize `path` on a worker thread.
 fn spawn_load(
     path: PathBuf,
     cells: (u32, u32),
     cell: CellSize,
     background: [u8; 3],
-    from_y: u32,
-    band: f32,
 ) -> Loading {
     let (tx, done) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = load(&path, cells, cell, background, from_y, band)
-            .map_err(|e| e.to_string())
-            .and_then(|shown| {
-                // compressing a full-screen image is most of
-                // the wait; only the write needs the terminal
-                kitty::encode(&shown.image)
-                    .map(|encoded| Ready { shown, encoded })
-                    .map_err(|e| e.to_string())
-            });
+        let result = load(&path, cells, cell, background).map_err(|e| e.to_string());
 
         // the receiver is gone if the viewer has moved on
         let _ = tx.send(result);
@@ -767,12 +866,27 @@ mod tests {
         assert!(PATIENCE < Duration::from_millis(500));
     }
 
+    /// A page with the whole of it handed to the terminal.
     fn shown(image: Framebuffer, kind: source::Kind, band_y: u32, doc_h: u32) -> Shown {
+        let band_h = image.height();
         Shown {
-            image,
+            image: Arc::new(image),
             id: 1,
             kind,
             band_y,
+            band_h,
+            doc_h,
+        }
+    }
+
+    /// A page with only `band_h` rows of it handed to the terminal.
+    fn banded(w: u32, doc_h: u32, band_y: u32, band_h: u32) -> Shown {
+        Shown {
+            image: Arc::new(Framebuffer::new(w, doc_h)),
+            id: 1,
+            kind: source::Kind::Document,
+            band_y,
+            band_h,
             doc_h,
         }
     }
@@ -799,21 +913,39 @@ mod tests {
     }
 
     #[test]
-    fn the_band_on_hand_is_enough_until_the_view_nears_its_edge() {
-        // 6000px document, a band covering the top 1000
-        let s = shown(Framebuffer::new(900, 1000), source::Kind::Document, 0, 6000);
+    fn a_band_is_cut_early_and_only_re_cut_once_it_runs_out() {
+        // a 6000px document with the terminal holding the top 1000
+        let s = banded(900, 6000, 0, 1000);
         let cells = (100, 30);
-
         let top = View::reset(&s, cells, CELL);
-        assert_eq!(needed_band(&s, &top, cells, CELL), None);
-
         let g = geom(&s, &top, cells, CELL);
-        let edge = View {
-            cy: 1000.0 - g.src_h / 2.0,
+        let slack = (g.band_h - g.src_h) / 2.0;
+        let trigger = slack * (1.0 - PREFETCH_AT);
+
+        // at the first line nothing is wanted, early or otherwise
+        assert_eq!(needed_band(&s, &top, cells, CELL), None);
+        assert_eq!(band_wanted(&s, &top, cells, CELL, PREFETCH_AT), None);
+
+        // most of the margin spent: cut the next band now, while
+        // there are still pixels left to scroll through
+        let nearly = View {
+            cy: g.src_h / 2.0 + (g.band_h - g.src_h - trigger) + 1.0,
             ..top
         };
-        let want = needed_band(&s, &edge, cells, CELL).expect("no band requested at the edge");
-        assert!(want > 0, "the new band should start further down");
+        assert!(
+            band_wanted(&s, &nearly, cells, CELL, PREFETCH_AT).is_some(),
+            "no band cut ahead of the reader"
+        );
+        assert_eq!(
+            needed_band(&s, &nearly, cells, CELL),
+            None,
+            "the slice still covers the view, so nothing is urgent yet"
+        );
+
+        // past the edge, the view is off the slice the terminal
+        // holds and the cut can no longer wait for a worker
+        let past = View { cy: 1200.0, ..top };
+        assert!(needed_band(&s, &past, cells, CELL).is_some());
     }
 
     #[test]
@@ -828,7 +960,7 @@ mod tests {
     fn the_last_band_of_a_document_asks_for_nothing_more() {
         // a band reaching the end must not request itself
         // forever at the bottom of every document
-        let s = shown(Framebuffer::new(900, 1000), source::Kind::Document, 5000, 6000);
+        let s = banded(900, 6000, 5000, 1000);
         let bottom = View {
             zoom: 1.0,
             cx: 450.0,

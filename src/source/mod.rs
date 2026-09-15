@@ -16,12 +16,6 @@ mod svg;
 pub struct Hints {
     pub max_w: u32,
     pub max_h: u32,
-    /// For a flowed source, how far down the document this slice starts.
-    //
-    // a document is drawn one band at a time; the whole of
-    // it can exceed what a terminal accepts as one image
-    #[cfg_attr(not(feature = "markdown"), allow(dead_code))]
-    pub from_y: u32,
 }
 
 /// A decoded source, and how much more of it there is.
