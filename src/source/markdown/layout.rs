@@ -4,7 +4,7 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::font;
-use super::parse::{Align, Block, Cell, Doc, Inline, Style, Table};
+use super::parse::{Align, Block, Callout, Cell, Doc, Inline, ListItem, Style, Table};
 
 /// A colour, as red, green, blue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +39,27 @@ pub enum Item {
     },
 }
 
+/// The bar and label colour of each kind of callout.
+pub struct Callouts {
+    pub note: Rgb,
+    pub tip: Rgb,
+    pub important: Rgb,
+    pub warning: Rgb,
+    pub caution: Rgb,
+}
+
+impl Callouts {
+    fn of(&self, c: Callout) -> Rgb {
+        match c {
+            Callout::Note => self.note,
+            Callout::Tip => self.tip,
+            Callout::Important => self.important,
+            Callout::Warning => self.warning,
+            Callout::Caution => self.caution,
+        }
+    }
+}
+
 pub struct Theme {
     pub bg: Rgb,
     pub fg: Rgb,
@@ -48,6 +69,7 @@ pub struct Theme {
     pub code_bg: Rgb,
     pub rule: Rgb,
     pub quote_bar: Rgb,
+    pub callout: Callouts,
     pub base_size: f32,
     pub heading_scale: [f32; 6],
     pub line_ratio: f32,
@@ -64,6 +86,13 @@ impl Theme {
         code_bg: Rgb(0x2a, 0x2a, 0x2a),
         rule: Rgb(0x3a, 0x3a, 0x3a),
         quote_bar: Rgb(0x4a, 0x4a, 0x4a),
+        callout: Callouts {
+            note: Rgb(0x53, 0x9b, 0xf5),
+            tip: Rgb(0x57, 0xab, 0x5a),
+            important: Rgb(0x98, 0x6e, 0xe2),
+            warning: Rgb(0xc6, 0x90, 0x26),
+            caution: Rgb(0xe5, 0x53, 0x4b),
+        },
         base_size: 16.0,
 
         // TODO: these three were eyeballed against a terminal,
@@ -130,7 +159,7 @@ impl Cursor<'_> {
                 self.flow(inlines, x, w, self.theme.base_size, Style::default());
             }
             Block::Code(lines) => self.code(lines, x, w),
-            Block::Quote(inner) => self.quote(inner, x, w),
+            Block::Quote { callout, blocks } => self.quote(*callout, blocks, x, w),
             Block::List { start, items } => self.list(*start, items, x, w),
             Block::Table(t) => self.table(t, x, w),
             Block::Rule => {
@@ -223,14 +252,32 @@ impl Cursor<'_> {
         self.y += h;
     }
 
-    fn quote(&mut self, inner: &[Block], x: f32, w: f32) {
+    fn quote(&mut self, callout: Option<Callout>, inner: &[Block], x: f32, w: f32) {
         let size = self.theme.base_size;
         let indent = size * font::ADVANCE_RATIO * 2.0;
+        let bar = match callout {
+            Some(c) => self.theme.callout.of(c),
+            None => self.theme.quote_bar,
+        };
 
         // the bar's height is not known until the contents are
         // laid out, so reserve its slot and insert it after
         let at = self.items.len();
         let y0 = self.y;
+
+        if let Some(c) = callout {
+            self.items.push(Item::Run {
+                x: x + indent,
+                baseline: self.y + size * font::ASCENT,
+                text: c.label().to_owned(),
+                size,
+                bold: true,
+                italic: false,
+                strike: false,
+                fill: bar,
+            });
+            self.y += size * self.theme.line_ratio;
+        }
 
         self.blocks(inner, x + indent, (w - indent).max(1.0));
 
@@ -241,12 +288,12 @@ impl Cursor<'_> {
                 y: y0,
                 w: (size * 0.15).max(2.0),
                 h: (self.y - y0).max(1.0),
-                fill: self.theme.quote_bar,
+                fill: bar,
             },
         );
     }
 
-    fn list(&mut self, start: Option<u64>, items: &[Vec<Block>], x: f32, w: f32) {
+    fn list(&mut self, start: Option<u64>, items: &[ListItem], x: f32, w: f32) {
         let size = self.theme.base_size;
         let advance = size * font::ADVANCE_RATIO;
 
@@ -254,9 +301,14 @@ impl Cursor<'_> {
             if i > 0 {
                 self.y += size * 0.3;
             }
-            let marker = match start {
-                Some(n) => format!("{}.", n + i as u64),
-                None => "\u{2022}".to_owned(),
+            // squares, not U+2610 BALLOT BOX: Liberation
+            // Mono has no ballot box and no check mark, and
+            // a missing glyph draws as nothing at all
+            let marker = match (item.task, start) {
+                (Some(true), _) => "\u{25a0}".to_owned(),
+                (Some(false), _) => "\u{25a1}".to_owned(),
+                (None, Some(n)) => format!("{}.", n + i as u64),
+                (None, None) => "\u{2022}".to_owned(),
             };
             let indent = (marker.width() + 1) as f32 * advance;
 
@@ -264,7 +316,7 @@ impl Cursor<'_> {
             // exists only once the body has been placed
             let at = self.items.len();
             let y0 = self.y;
-            self.blocks(item, x + indent, (w - indent).max(1.0));
+            self.blocks(&item.blocks, x + indent, (w - indent).max(1.0));
 
             let baseline = y0 + size * font::ASCENT;
             self.items.insert(

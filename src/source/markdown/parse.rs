@@ -3,7 +3,7 @@
 // nothing here deals in pixels, fonts or SVG
 
 use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 
 /// A parsed document: blocks in reading order, nested where markdown nests.
@@ -18,8 +18,8 @@ pub enum Block {
     Paragraph(Vec<Inline>),
     /// Already split on newlines, with tabs still in place.
     Code(Vec<String>),
-    List { start: Option<u64>, items: Vec<Vec<Block>> },
-    Quote(Vec<Block>),
+    List { start: Option<u64>, items: Vec<ListItem> },
+    Quote { callout: Option<Callout>, blocks: Vec<Block> },
     Table(Table),
     Rule,
 }
@@ -41,6 +41,37 @@ pub enum Align {
     Left,
     Center,
     Right,
+}
+
+/// One item of a list, and whether it carried a task checkbox.
+#[derive(Debug, Default, PartialEq)]
+pub struct ListItem {
+    /// `None` for an ordinary item, `Some(done)` for `- [ ]` or `- [x]`.
+    pub task: Option<bool>,
+    pub blocks: Vec<Block>,
+}
+
+/// A GitHub alert: the kind named by `> [!NOTE]` and its siblings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Callout {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl Callout {
+    /// The word drawn above the quote.
+    pub fn label(self) -> &'static str {
+        match self {
+            Callout::Note => "Note",
+            Callout::Tip => "Tip",
+            Callout::Important => "Important",
+            Callout::Warning => "Warning",
+            Callout::Caution => "Caution",
+        }
+    }
 }
 
 /// Inline content, with emphasis already flattened onto each run.
@@ -68,6 +99,11 @@ pub fn parse(text: &str) -> Doc {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_TASKLISTS);
+
+    // the only GFM extra this asks for is the kind on a
+    // blockquote, which is where [!NOTE] arrives
+    opts.insert(Options::ENABLE_GFM);
 
     let mut b = Builder::default();
     for event in Parser::new_ext(text, opts) {
@@ -78,9 +114,9 @@ pub fn parse(text: &str) -> Doc {
 
 /// What sort of container is open, for the block stack to close back into.
 enum Open {
-    Quote,
-    List { start: Option<u64>, items: Vec<Vec<Block>> },
-    Item,
+    Quote(Option<Callout>),
+    List { start: Option<u64>, items: Vec<ListItem> },
+    Item { task: Option<bool> },
 }
 
 /// Which block the inlines arriving now belong to.
@@ -151,6 +187,15 @@ impl Builder {
             }
 
             Event::Rule => self.push(Block::Rule),
+
+            // the marker arrives inside the item it belongs
+            // to, so it is recorded on the open item rather
+            // than placed among that item's inlines
+            Event::TaskListMarker(done) => {
+                if let Some(Open::Item { task }) = self.opens.last_mut() {
+                    *task = Some(done);
+                }
+            }
             _ => {}
         }
     }
@@ -162,8 +207,8 @@ impl Builder {
                 self.where_ = Some(Inlines::Heading(heading_level(level)));
             }
             Tag::CodeBlock(_) => self.code = Some(String::new()),
-            Tag::BlockQuote(_) => {
-                self.opens.push(Open::Quote);
+            Tag::BlockQuote(kind) => {
+                self.opens.push(Open::Quote(kind.map(callout)));
                 self.levels.push(Vec::new());
             }
             Tag::List(start) => self.opens.push(Open::List {
@@ -171,7 +216,7 @@ impl Builder {
                 items: Vec::new(),
             }),
             Tag::Item => {
-                self.opens.push(Open::Item);
+                self.opens.push(Open::Item { task: None });
                 self.levels.push(Vec::new());
             }
             Tag::Emphasis => self.italic += 1,
@@ -223,16 +268,22 @@ impl Builder {
                 self.push(Block::Code(lines));
             }
             TagEnd::BlockQuote(_) => {
-                let inner = self.levels.pop().unwrap_or_default();
-                self.opens.pop();
-                self.push(Block::Quote(inner));
+                let blocks = self.levels.pop().unwrap_or_default();
+                let callout = match self.opens.pop() {
+                    Some(Open::Quote(c)) => c,
+                    _ => None,
+                };
+                self.push(Block::Quote { callout, blocks });
             }
             TagEnd::Item => {
                 self.flush_loose_inlines();
-                let item = self.levels.pop().unwrap_or_default();
-                self.opens.pop();
+                let blocks = self.levels.pop().unwrap_or_default();
+                let task = match self.opens.pop() {
+                    Some(Open::Item { task }) => task,
+                    _ => None,
+                };
                 if let Some(Open::List { items, .. }) = self.opens.last_mut() {
-                    items.push(item);
+                    items.push(ListItem { task, blocks });
                 }
             }
             TagEnd::List(_) => {
@@ -336,7 +387,10 @@ impl Builder {
         while self.levels.len() > 1 {
             let inner = self.levels.pop().unwrap();
             match self.opens.pop() {
-                Some(Open::Quote) => self.push(Block::Quote(inner)),
+                Some(Open::Quote(callout)) => self.push(Block::Quote {
+                    callout,
+                    blocks: inner,
+                }),
                 _ => {
                     if let Some(level) = self.levels.last_mut() {
                         level.extend(inner);
@@ -347,6 +401,16 @@ impl Builder {
         Doc {
             blocks: self.levels.pop().unwrap_or_default(),
         }
+    }
+}
+
+fn callout(kind: BlockQuoteKind) -> Callout {
+    match kind {
+        BlockQuoteKind::Note => Callout::Note,
+        BlockQuoteKind::Tip => Callout::Tip,
+        BlockQuoteKind::Important => Callout::Important,
+        BlockQuoteKind::Warning => Callout::Warning,
+        BlockQuoteKind::Caution => Callout::Caution,
     }
 }
 
@@ -461,7 +525,10 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(
             items[0],
-            vec![Block::Paragraph(vec![plain("one", Style::default())])]
+            ListItem {
+                task: None,
+                blocks: vec![Block::Paragraph(vec![plain("one", Style::default())])],
+            }
         );
     }
 
@@ -510,6 +577,41 @@ mod tests {
     }
 
     #[test]
+    fn a_task_item_records_whether_it_is_done() {
+        let doc = parse("- [x] done\n- [ ] todo\n- plain\n");
+        let Block::List { items, .. } = &doc.blocks[0] else {
+            panic!("expected a list, got {:?}", doc.blocks[0]);
+        };
+        let tasks: Vec<_> = items.iter().map(|i| i.task).collect();
+        assert_eq!(tasks, vec![Some(true), Some(false), None]);
+    }
+
+    #[test]
+    fn a_callout_keeps_its_kind() {
+        let doc = parse("> [!WARNING]\n> mind the gap\n");
+        let Block::Quote { callout, blocks } = &doc.blocks[0] else {
+            panic!("expected a quote, got {:?}", doc.blocks[0]);
+        };
+        assert_eq!(*callout, Some(Callout::Warning));
+        assert_eq!(
+            *blocks,
+            vec![Block::Paragraph(vec![plain(
+                "mind the gap",
+                Style::default()
+            )])]
+        );
+    }
+
+    #[test]
+    fn a_plain_quote_has_no_callout() {
+        let doc = parse("> just a quote\n");
+        let Block::Quote { callout, .. } = &doc.blocks[0] else {
+            panic!("expected a quote");
+        };
+        assert_eq!(*callout, None);
+    }
+
+    #[test]
     fn a_table_keeps_its_alignments_and_cells() {
         let doc = parse("| a | b | c |\n|:--|:-:|--:|\n| 1 | 2 | 3 |\n");
         let Block::Table(t) = &doc.blocks[0] else {
@@ -536,10 +638,10 @@ mod tests {
         let doc = parse("> quoted\n");
         assert_eq!(
             doc.blocks,
-            vec![Block::Quote(vec![Block::Paragraph(vec![plain(
-                "quoted",
-                Style::default()
-            )])])]
+            vec![Block::Quote {
+                callout: None,
+                blocks: vec![Block::Paragraph(vec![plain("quoted", Style::default())])],
+            }]
         );
     }
 }
