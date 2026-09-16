@@ -158,6 +158,43 @@ pub fn place(out: &mut impl Write, id: u32, p: &Placement) -> io::Result<()> {
     )
 }
 
+/// The block of image ids the one-shot renderer draws from.
+//
+// high and recognisable in a trace, and far from the low ids
+// a client that has not thought about ids will pick: the
+// block is deleted wholesale, so anything else inside it goes
+// too
+const PRINT_BASE: u32 = 0xC0DE_0000;
+
+/// How many ids that block holds.
+//
+// one run's images all have to fit, and a run is one id per
+// picture plus at most five per document, since a page is
+// capped at MAX_PIXELS and cut at CHUNK_PIXELS. so this is a
+// file count, and a terminal runs out of memory for the
+// pixels long before a million files run it out of ids
+const PRINT_SPAN: u32 = 1 << 20;
+
+// id 0 means unspecified to the terminal, and a block running
+// off the end of a u32 would wrap into it
+const _: () = assert!(PRINT_BASE > 0);
+const _: () = assert!(PRINT_BASE.checked_add(PRINT_SPAN).is_some());
+
+/// The id for the one-shot renderer's `n`th image of a run.
+pub fn print_id(n: u32) -> u32 {
+    PRINT_BASE + n % PRINT_SPAN
+}
+
+/// Drop every image the one-shot renderer left behind, freeing the pixels of
+/// any the scrollback no longer refers to.
+//
+// d=R is the range form, and the capital frees the data
+// rather than only dropping the placements
+pub fn forget_prints(out: &mut impl Write) -> io::Result<()> {
+    let last = PRINT_BASE + PRINT_SPAN - 1;
+    write!(out, "\x1b_Ga=d,d=R,x={PRINT_BASE},y={last},q=2;\x1b\\")
+}
+
 /// Drop the image stored under `id` and free its pixel data.
 pub fn forget(out: &mut impl Write, id: u32) -> io::Result<()> {
     write!(out, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\")
@@ -230,6 +267,31 @@ mod tests {
         let mut out = Vec::new();
         write(&mut out, &fb, 7).unwrap();
         assert_eq!(payload_of(&out), *fb.as_raw());
+    }
+
+    #[test]
+    fn a_print_id_stays_inside_the_block_it_is_deleted_with() {
+        // the block is deleted wholesale at the start of a
+        // run, so an id outside it would survive and leak
+        for n in [0, 1, 999, PRINT_SPAN - 1, PRINT_SPAN, PRINT_SPAN + 7, u32::MAX] {
+            let id = print_id(n);
+            assert!(
+                (PRINT_BASE..PRINT_BASE + PRINT_SPAN).contains(&id),
+                "image {n} took id {id:#x}, outside the block"
+            );
+        }
+    }
+
+    #[test]
+    fn the_block_delete_names_the_whole_block() {
+        let mut out = Vec::new();
+        forget_prints(&mut out).unwrap();
+        let lo = print_id(0);
+        let hi = print_id(PRINT_SPAN - 1);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("\x1b_Ga=d,d=R,x={lo},y={hi},q=2;\x1b\\")
+        );
     }
 
     #[test]

@@ -156,16 +156,28 @@ What makes that possible is layout's own output, kept rather than recomputed.
 `lines_of` reads the text back out of the positioned runs in the display list,
 so there is no second copy of the page's words to keep in step with the first.
 
-`--print` leaves its images in the terminal's memory, and they appear to stay
-there indefinitely. Every run transmits under a fresh id from
-`kitty::next_id()` and nothing is ever deleted, so a day of runs accumulates.
-Unresolved. The `a=d` commands are where to look: they distinguish removing a
-placement from freeing the image data, and which key does which wants checking
-against the spec rather than remembering. The difficulty is that an image
-already in the scrollback has to stay alive to be redrawn, so the data cannot
-simply be freed after placing it. Measure the terminal's own storage limit and
-eviction policy first, since this may be one terminal's behaviour rather than
-the protocol's.
+`--print` takes its image ids from one block and deletes that whole block
+before it draws, so a run's images replace the last run's instead of joining
+them. Before that, every run transmitted under a fresh id and nothing was ever
+deleted, and a day of printing stayed in the terminal's memory. `--keep` skips
+the delete and takes fresh ids, for a scrollback you want to keep.
+
+The delete is `a=d,d=R`, and the capital is what frees the pixels: the
+lowercase form drops the placements and keeps the data so it can be shown
+again. A terminal will only free an image the scrollback no longer refers to,
+which is why deleting the block is the whole mechanism rather than half of it.
+The placements go with it.
+
+A run has to fit in the block. That is a million ids against one per picture
+and at most five per document, since a page is capped at `MAX_PIXELS` and cut
+into `CHUNK_PIXELS` pieces, so a terminal runs out of memory for the pixels
+long before a run runs out of ids. Pick the base high: a low id is what a
+client that has not thought about ids will choose, and the block is deleted
+wholesale.
+
+Two runs at once in the same terminal share the block, so the second wipes the
+first. That is the price of the default. Whether the terminal hands the memory
+back is then its own business, so measure it rather than assuming.
 
 Reuse one placement id and let the new placement replace the old one. Delete
 the old one first and the background shows through the gap, which reads as a

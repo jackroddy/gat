@@ -21,6 +21,29 @@ struct Args {
     background: [u8; 3],
     force: bool,
     print: bool,
+    keep: bool,
+}
+
+/// Where the one-shot renderer's image ids come from.
+enum Ids {
+    /// The same block every run, so only the latest run's images are stored.
+    Block(u32),
+
+    /// Fresh every run, so images earlier runs left stay where they are.
+    Fresh,
+}
+
+impl Ids {
+    fn next(&mut self) -> u32 {
+        match self {
+            Ids::Block(n) => {
+                let id = render::kitty::print_id(*n);
+                *n += 1;
+                id
+            }
+            Ids::Fresh => render::kitty::next_id(),
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -69,8 +92,22 @@ fn main() -> ExitCode {
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
     let mut failed = false;
+
+    // one run's images replace the last one's, so a terminal
+    // does not end the day holding every picture ever printed
+    // into it. --keep is for a scrollback you want to keep
+    let mut ids = if args.keep {
+        Ids::Fresh
+    } else {
+        if let Err(e) = render::kitty::forget_prints(&mut out) {
+            eprintln!("gat: {e}");
+            return ExitCode::FAILURE;
+        }
+        Ids::Block(0)
+    };
+
     for path in &args.files {
-        if let Err(e) = show(&mut out, path, &budget, args.background) {
+        if let Err(e) = show(&mut out, path, &budget, args.background, &mut ids) {
             let _ = out.flush();
             eprintln!("gat: {}: {e}", path.display());
             failed = true;
@@ -88,6 +125,7 @@ fn show(
     path: &std::path::Path,
     budget: &Budget,
     background: [u8; 3],
+    ids: &mut Ids,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
     let flowed = source::kind(&bytes, path) == source::Kind::Document;
@@ -119,7 +157,7 @@ fn show(
         framebuffer::flatten_onto(&mut fb, background);
 
         let rows = fb.height().div_ceil(budget.cell.h);
-        render::kitty::write(out, &fb, render::kitty::next_id())?;
+        render::kitty::write(out, &fb, ids.next())?;
 
         // the renderer sets C=1, so the cursor is still at the
         // image's top left corner and the next output would
@@ -144,6 +182,7 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
         background: [0, 0, 0],
         force: false,
         print: false,
+        keep: false,
     };
 
     let mut parser = lexopt::Parser::from_env();
@@ -164,6 +203,7 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Long("fit-height") => args.fill_height = true,
             Long("force-kitty") => args.force = true,
             Long("print") => args.print = true,
+            Long("keep") => args.keep = true,
             Long("probe") => {
                 print!("terminal probe:\n{}", term::explain());
                 let t = term::Terminal::detect();
@@ -218,6 +258,7 @@ usage: gat [options] <file>...
       --fit-height     use the full height, letting width overflow
   -b, --background C   composite transparency over color C (#rrggbb)
       --print          write the image to stdout and exit, no viewer
+      --keep           leave images from earlier runs in the terminal
       --force-kitty    emit kitty sequences even if detection says no
       --probe          report what terminal detection sees, then exit
   -h, --help           this text
