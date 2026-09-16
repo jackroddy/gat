@@ -4,7 +4,7 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::font;
-use super::parse::{Block, Doc, Inline, Style};
+use super::parse::{Align, Block, Cell, Doc, Inline, Style, Table};
 
 /// A colour, as red, green, blue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +132,7 @@ impl Cursor<'_> {
             Block::Code(lines) => self.code(lines, x, w),
             Block::Quote(inner) => self.quote(inner, x, w),
             Block::List { start, items } => self.list(*start, items, x, w),
+            Block::Table(t) => self.table(t, x, w),
             Block::Rule => {
                 let size = self.theme.base_size;
                 self.y += size * 0.5;
@@ -281,6 +282,156 @@ impl Cursor<'_> {
             );
         }
     }
+
+    fn table(&mut self, t: &Table, x: f32, w: f32) {
+        let size = self.theme.base_size;
+        let advance = size * font::ADVANCE_RATIO;
+
+        let n = t
+            .rows
+            .iter()
+            .map(Vec::len)
+            .chain(std::iter::once(t.head.len()))
+            .max()
+            .unwrap_or(0);
+        if n == 0 {
+            return;
+        }
+
+        let cols = ((w / advance).floor() as usize).max(1);
+        let widths = column_widths(t, n, cols);
+
+        // where each column begins, in characters from the
+        // table's left edge
+        let mut starts = Vec::with_capacity(n);
+        let mut at = 0;
+        for width in &widths {
+            starts.push(at);
+            at += width + TABLE_GAP;
+        }
+        let span = at - TABLE_GAP;
+
+        if !t.head.is_empty() {
+            let bold = Style {
+                bold: true,
+                ..Style::default()
+            };
+            self.table_row(&t.head, &widths, &starts, &t.align, x, bold);
+
+            self.y += size * 0.2;
+            self.items.push(Item::Rect {
+                x,
+                y: self.y,
+                w: span as f32 * advance,
+                h: 1.0,
+                fill: self.theme.rule,
+            });
+            self.y += 1.0 + size * 0.2;
+        }
+
+        for row in &t.rows {
+            self.table_row(row, &widths, &starts, &t.align, x, Style::default());
+        }
+    }
+
+    /// Draw one row, every cell wrapped to its own column width.
+    fn table_row(
+        &mut self,
+        cells: &[Cell],
+        widths: &[usize],
+        starts: &[usize],
+        align: &[Align],
+        x: f32,
+        base: Style,
+    ) {
+        let size = self.theme.base_size;
+        let advance = size * font::ADVANCE_RATIO;
+        let line_h = size * self.theme.line_ratio;
+
+        let wrapped: Vec<Vec<Vec<Piece>>> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| wrap(cell, widths.get(i).copied().unwrap_or(1), base))
+            .collect();
+
+        // a row is as tall as its deepest cell
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(0);
+
+        for j in 0..height {
+            let baseline = self.y + size * font::ASCENT;
+            for (i, lines) in wrapped.iter().enumerate() {
+                let Some(line) = lines.get(j) else { continue };
+                let width = widths.get(i).copied().unwrap_or(1);
+                let used = line.last().map_or(0, |p| p.col + p.text.width());
+                let pad = match align.get(i).copied().unwrap_or_default() {
+                    Align::Left => 0,
+                    Align::Center => width.saturating_sub(used) / 2,
+                    Align::Right => width.saturating_sub(used),
+                };
+                for piece in line {
+                    self.items.push(Item::Run {
+                        x: x + (starts[i] + pad + piece.col) as f32 * advance,
+                        baseline,
+                        size,
+                        bold: piece.style.bold,
+                        italic: piece.style.italic,
+                        strike: piece.style.strike,
+                        fill: self.colour(&piece.style),
+                        text: piece.text.clone(),
+                    });
+                }
+            }
+            self.y += line_h;
+        }
+    }
+}
+
+/// Blank characters between one table column and the next.
+const TABLE_GAP: usize = 2;
+
+/// Column widths in characters: each column's natural width, then the widest
+/// shrunk one at a time until the row fits `total`.
+fn column_widths(t: &Table, n: usize, total: usize) -> Vec<usize> {
+    let mut widths = vec![1usize; n];
+    for row in std::iter::once(&t.head).chain(t.rows.iter()) {
+        for (i, cell) in row.iter().enumerate().take(n) {
+            widths[i] = widths[i].max(natural_width(cell));
+        }
+    }
+
+    // shrink the widest, so a column of prose wraps before a
+    // column of short keys is squeezed to nothing
+    let avail = total.saturating_sub(TABLE_GAP * (n - 1)).max(n);
+    while widths.iter().sum::<usize>() > avail {
+        let Some((at, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > 1)
+            .max_by_key(|(_, w)| **w)
+        else {
+            break;
+        };
+        widths[at] -= 1;
+    }
+    widths
+}
+
+/// The width a cell would take if it were never wrapped.
+fn natural_width(cell: &[Inline]) -> usize {
+    let mut w = 0;
+    let mut first = true;
+    for tok in tokens(cell, Style::default()) {
+        match tok {
+            Tok::Word {
+                text, space_before, ..
+            } => {
+                w += text.width() + usize::from(space_before && !first);
+                first = false;
+            }
+            Tok::Break => w += 1,
+        }
+    }
+    w
 }
 
 /// One styled fragment on a line, positioned in columns from the left margin.
@@ -472,6 +623,51 @@ fn expand_tabs(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cell(text: &str) -> Cell {
+        vec![Inline::Text {
+            text: text.into(),
+            style: Style::default(),
+        }]
+    }
+
+    #[test]
+    fn a_table_that_fits_keeps_every_column_at_its_natural_width() {
+        let t = Table {
+            align: vec![Align::Left; 2],
+            head: vec![cell("key"), cell("value")],
+            rows: vec![vec![cell("a"), cell("bb")]],
+        };
+        assert_eq!(column_widths(&t, 2, 80), vec![3, 5]);
+    }
+
+    #[test]
+    fn a_table_too_wide_shrinks_its_widest_column_first() {
+        // 6 + 2 gap + 40 is 48, so eight characters have to
+        // come off, and all of them off the prose column
+        let t = Table {
+            align: vec![Align::Left; 2],
+            head: vec![cell("symbol"), cell(&"x".repeat(40))],
+            rows: vec![],
+        };
+        assert_eq!(column_widths(&t, 2, 40), vec![6, 32]);
+    }
+
+    #[test]
+    fn a_table_far_too_narrow_stops_at_one_character_a_column() {
+        let t = Table {
+            align: vec![Align::Left; 3],
+            head: vec![cell("aaaa"), cell("bbbb"), cell("cccc")],
+            rows: vec![],
+        };
+        assert_eq!(column_widths(&t, 3, 4), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn a_cells_natural_width_counts_the_spaces_between_its_words() {
+        assert_eq!(natural_width(&cell("one two")), 7);
+        assert_eq!(natural_width(&cell("")), 0);
+    }
     use crate::source::markdown::parse;
 
     fn text(s: &str) -> Vec<Inline> {

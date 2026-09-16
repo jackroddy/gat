@@ -2,7 +2,9 @@
 //
 // nothing here deals in pixels, fonts or SVG
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 
 /// A parsed document: blocks in reading order, nested where markdown nests.
 #[derive(Debug, Default, PartialEq)]
@@ -18,7 +20,27 @@ pub enum Block {
     Code(Vec<String>),
     List { start: Option<u64>, items: Vec<Vec<Block>> },
     Quote(Vec<Block>),
+    Table(Table),
     Rule,
+}
+
+/// The inline content of one table cell.
+pub type Cell = Vec<Inline>;
+
+#[derive(Debug, Default, PartialEq)]
+pub struct Table {
+    /// One entry per column, from the delimiter row.
+    pub align: Vec<Align>,
+    pub head: Vec<Cell>,
+    pub rows: Vec<Vec<Cell>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    Left,
+    Center,
+    Right,
 }
 
 /// Inline content, with emphasis already flattened onto each run.
@@ -43,10 +65,9 @@ pub struct Style {
 }
 
 pub fn parse(text: &str) -> Doc {
-    // tables and footnotes stay off: a table renders instead as
-    // paragraphs of pipe-separated text until layout can do one
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TABLES);
 
     let mut b = Builder::default();
     for event in Parser::new_ext(text, opts) {
@@ -89,6 +110,11 @@ struct Builder {
     link: u32,
 
     code: Option<String>,
+
+    table: Option<Table>,
+
+    /// Cells of the row being read, for whichever of head or rows it joins.
+    row: Vec<Cell>,
 }
 
 impl Builder {
@@ -156,6 +182,17 @@ impl Builder {
                 self.where_ = Some(Inlines::ImageAlt);
                 self.alt.clear();
             }
+
+            Tag::Table(align) => {
+                self.table = Some(Table {
+                    align: align.iter().copied().map(align_of).collect(),
+                    ..Table::default()
+                });
+            }
+
+            // a cell's content arrives as ordinary inlines,
+            // so it needs somewhere for them to land
+            Tag::TableCell => self.where_ = Some(Inlines::Paragraph),
             _ => {}
         }
     }
@@ -212,6 +249,32 @@ impl Builder {
                 self.where_ = None;
                 self.open_inlines();
                 self.inlines.push(Inline::Image { alt });
+            }
+
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.inlines);
+                self.where_ = None;
+                self.row.push(cell);
+            }
+
+            // the head emits its cells directly, with no row
+            // of its own around them
+            TagEnd::TableHead => {
+                let row = std::mem::take(&mut self.row);
+                if let Some(t) = self.table.as_mut() {
+                    t.head = row;
+                }
+            }
+            TagEnd::TableRow => {
+                let row = std::mem::take(&mut self.row);
+                if let Some(t) = self.table.as_mut() {
+                    t.rows.push(row);
+                }
+            }
+            TagEnd::Table => {
+                if let Some(t) = self.table.take() {
+                    self.push(Block::Table(t));
+                }
             }
             _ => {}
         }
@@ -284,6 +347,14 @@ impl Builder {
         Doc {
             blocks: self.levels.pop().unwrap_or_default(),
         }
+    }
+}
+
+fn align_of(a: Alignment) -> Align {
+    match a {
+        Alignment::Right => Align::Right,
+        Alignment::Center => Align::Center,
+        Alignment::None | Alignment::Left => Align::Left,
     }
 }
 
@@ -436,6 +507,28 @@ mod tests {
                 alt: "a cat".into()
             }]
         );
+    }
+
+    #[test]
+    fn a_table_keeps_its_alignments_and_cells() {
+        let doc = parse("| a | b | c |\n|:--|:-:|--:|\n| 1 | 2 | 3 |\n");
+        let Block::Table(t) = &doc.blocks[0] else {
+            panic!("expected a table, got {:?}", doc.blocks[0]);
+        };
+        assert_eq!(t.align, vec![Align::Left, Align::Center, Align::Right]);
+        assert_eq!(t.head.len(), 3);
+        assert_eq!(t.head[0], vec![plain("a", Style::default())]);
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(t.rows[0][2], vec![plain("3", Style::default())]);
+    }
+
+    #[test]
+    fn a_column_with_no_alignment_marker_reads_as_left() {
+        let doc = parse("| a |\n|---|\n| 1 |\n");
+        let Block::Table(t) = &doc.blocks[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(t.align, vec![Align::Left]);
     }
 
     #[test]
