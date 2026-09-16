@@ -156,6 +156,17 @@ What makes that possible is layout's own output, kept rather than recomputed.
 `lines_of` reads the text back out of the positioned runs in the display list,
 so there is no second copy of the page's words to keep in step with the first.
 
+`--print` leaves its images in the terminal's memory, and they appear to stay
+there indefinitely. Every run transmits under a fresh id from
+`kitty::next_id()` and nothing is ever deleted, so a day of runs accumulates.
+Unresolved. The `a=d` commands are where to look: they distinguish removing a
+placement from freeing the image data, and which key does which wants checking
+against the spec rather than remembering. The difficulty is that an image
+already in the scrollback has to stay alive to be redrawn, so the data cannot
+simply be freed after placing it. Measure the terminal's own storage limit and
+eviction policy first, since this may be one terminal's behaviour rather than
+the protocol's.
+
 Reuse one placement id and let the new placement replace the old one. Delete
 the old one first and the background shows through the gap, which reads as a
 flash on every keypress.
@@ -221,6 +232,12 @@ uses and the ladder does not. In its favour: the builds that sent 5 megapixels
 drew and the ones that sent 16 did not, and neither figure matches the 19 the
 ladder accepts outside the alternate screen. The next test is that same ladder
 wrapped in `\x1b[?1049h`.
+
+herdr's kitty graphics support is deliberate, and is said to be better as of
+0.9, which is the version everything above was measured against. Nothing here
+explains how that squares with the refusals, so the next thing to read is
+herdr's own implementation: which transport it actually wants is a question
+its source should answer, and answering it beats another round of probing.
 
 `gat --probe` carries the ladder. It stores and places an image at a range of
 heights the way the viewer does and prints what came back, reading the replies
