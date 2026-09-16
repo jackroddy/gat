@@ -8,12 +8,30 @@ WezTerm or Konsole.
 ## Use
 
 ```
-gat photo.png          # viewer: hjkl or arrows pan, +/- zoom, n/p file, q quit
+gat photo.png          # open the viewer
 gat --print notes.md   # draw it where the cursor is and exit
 gat --probe            # what detection saw of your terminal
 ```
 
 `--print` also runs when stdout is not a terminal, so pipes and redirects work.
+
+In the viewer:
+
+```
+hjkl or arrows   pan
++ -              zoom
+0                reset the view
+/                search
+] [              next, previous match
+} {              next, previous heading
+n p              next, previous file
+q                quit
+```
+
+gat draws markdown as a page rather than as styled terminal text: headings at
+real sizes, tables, task lists, footnotes, callouts, and code blocks coloured
+by language. Search still works, because the page keeps the text it was laid
+out from.
 
 ## Install
 
