@@ -341,8 +341,13 @@ fn event_loop(
                     dirty = true;
                 }
                 Key::Zoom(factor) => {
-                    view.zoom = (view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
-                    dirty = true;
+                    // a document is laid out at the width it is
+                    // drawn at, so zooming it returns the same
+                    // words larger rather than more of them
+                    if !document(&shown) {
+                        view.zoom = (view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+                        dirty = true;
+                    }
                 }
                 Key::Search => {
                     typing = Some(Vec::new());
@@ -407,6 +412,13 @@ fn type_into(buf: &mut Vec<u8>, input: &[u8]) -> (Typed, usize) {
         }
     }
     (Typed::More, input.len())
+}
+
+/// Whether what is on screen is a page of text rather than a picture.
+fn document(shown: &Option<Shown>) -> bool {
+    shown
+        .as_ref()
+        .is_some_and(|s| s.kind == source::Kind::Document)
 }
 
 /// Move the view to hit `at`, and say what the status line should show.
@@ -567,13 +579,18 @@ fn draw(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let place = format!("[{}/{}]", index + 1, files.len());
     let status = match (failure, note) {
         (Some(e), _) => format!("{name}  {e}"),
         (None, Some(n)) => format!("{name}  {n}"),
+
+        // the keys a picture has are not the keys a document
+        // has, and listing both leaves neither room to read
+        (None, None) if document(shown) => {
+            format!("{name}  {place}  hjkl pan  0 top  / find  ][ hit  }}{{ head  np file  q quit")
+        }
         (None, None) => format!(
-            "{name}  [{}/{}]  {:.0}%  hjkl pan  +- zoom  0 reset  / find  ][ hit  }}{{ head  np file  q quit",
-            index + 1,
-            files.len(),
+            "{name}  {place}  {:.0}%  hjkl pan  +- zoom  0 reset  np file  q quit",
             view.zoom * 100.0
         ),
     };
@@ -874,6 +891,43 @@ mod tests {
         // twice more than there is to delete
         type_into(&mut buf, b"\x7f\x7f");
         assert!(buf.is_empty());
+    }
+
+    /// The status line `draw` ended up writing.
+    fn status_of(kind: source::Kind, name: &str) -> String {
+        let mut out = Vec::new();
+        let files = [PathBuf::from(name)];
+        draw(
+            &mut out,
+            &Some(shown(image(400, 4000), kind)),
+            &view(1.0, 200.0, 300.0),
+            (100, 24),
+            CELL,
+            &files,
+            0,
+            &None,
+            None,
+        )
+        .unwrap();
+        let all = String::from_utf8_lossy(&out).into_owned();
+        all.rsplit("\x1b[K").next().unwrap_or_default().to_owned()
+    }
+
+    #[test]
+    fn a_document_is_offered_no_zoom_and_the_keys_it_has() {
+        let s = status_of(source::Kind::Document, "notes.md");
+        assert!(!s.contains("zoom"), "{s}");
+        assert!(!s.contains('%'), "a document is always drawn 1:1: {s}");
+        assert!(s.contains("/ find"), "{s}");
+        assert!(s.contains("head"), "{s}");
+    }
+
+    #[test]
+    fn a_picture_keeps_zoom_and_is_not_offered_the_document_keys() {
+        let s = status_of(source::Kind::Image, "photo.png");
+        assert!(s.contains("+- zoom"), "{s}");
+        assert!(s.contains("100%"), "{s}");
+        assert!(!s.contains("find"), "searching a picture means nothing: {s}");
     }
 
     #[test]
