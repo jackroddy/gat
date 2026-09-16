@@ -19,12 +19,13 @@ In the viewer:
 
 ```
 hjkl or arrows   pan
-+ -              zoom
-0                reset the view
-/                search
-] [              next, previous match
+g G              top, bottom
+/ ?              search forward, backward
+n N              next, previous match
 } {              next, previous heading
-n p              next, previous file
+tab shift-tab    next, previous file
++ -              zoom (pictures)
+0                reset the view (pictures)
 q                quit
 ```
 

@@ -189,7 +189,13 @@ enum Key {
     Reset,
     Next,
     Prev,
-    Search,
+
+    /// Start a search, forwards for 1 and back for -1.
+    Search(i32),
+
+    /// The top or the bottom of the page.
+    Top,
+    Bottom,
 
     /// Step to another search hit, forwards for 1 and back for -1.
     Hit(i32),
@@ -232,6 +238,9 @@ fn event_loop(
     // lines holding the current query, as indices into the page's own
     let mut hits: Vec<source::Hit> = Vec::new();
     let mut hit = 0usize;
+
+    // which way the search that is being typed will run
+    let mut seek = 1i32;
 
     // shrunk on refusal, never below one viewport
 
@@ -377,7 +386,12 @@ fn event_loop(
                         None => Vec::new(),
                     };
 
-                    hit = 0;
+                    // from where the reader is, not from the top
+                    // of the document, which is what / does
+                    hit = match &shown {
+                        Some(s) => first_hit(s, &view, &hits, seek, cells, cell),
+                        None => 0,
+                    };
                     note = Some(step(&mut view, &shown, &hits, hit, &query, cells, cell));
                 }
             }
@@ -413,8 +427,21 @@ fn event_loop(
                         dirty = true;
                     }
                 }
-                Key::Search => {
+                Key::Search(dir) => {
                     typing = Some(Vec::new());
+                    seek = dir;
+                    dirty = true;
+                }
+                Key::Top | Key::Bottom => {
+                    if let Some(s) = &shown {
+                        let g = geom(s, &view, cells, cell);
+                        view.cy = match key {
+                            Key::Top => g.src_h / 2.0,
+                            _ => (g.doc_h - g.src_h / 2.0).max(g.src_h / 2.0),
+                        };
+                        snap(&mut view, s, cells, cell);
+                    }
+                    note = None;
                     dirty = true;
                 }
                 Key::Hit(dir) => {
@@ -562,6 +589,31 @@ fn document(shown: &Option<Shown>) -> bool {
     shown
         .as_ref()
         .is_some_and(|s| s.kind == source::Kind::Document)
+}
+
+/// The hit a fresh search lands on, looking `dir` from where the window is.
+fn first_hit(
+    s: &Shown,
+    view: &View,
+    hits: &[source::Hit],
+    dir: i32,
+    cells: (u32, u32),
+    cell: CellSize,
+) -> usize {
+    let Some(ix) = &s.index else { return 0 };
+    if hits.is_empty() {
+        return 0;
+    }
+    let top = geom(s, view, cells, cell).doc_top;
+    let y = |h: &source::Hit| f64::from(ix.lines[h.line].y);
+
+    if dir > 0 {
+        hits.iter().position(|h| y(h) > top).unwrap_or(0)
+    } else {
+        hits.iter()
+            .rposition(|h| y(h) < top)
+            .unwrap_or(hits.len() - 1)
+    }
 }
 
 /// Move the view to hit `at`, and say what the status line should show.
@@ -828,10 +880,10 @@ fn draw(
         // the keys a picture has are not the keys a document
         // has, and listing both leaves neither room to read
         (None, None) if document(shown) => {
-            format!("{name}  {place}  hjkl pan  0 top  / find  ][ hit  }}{{ head  np file  q quit")
+            format!("{name}  {place}  hjkl pan  gG ends  / find  nN match  }}{{ head  tab file  q quit")
         }
         (None, None) => format!(
-            "{name}  {place}  {:.0}%  hjkl pan  +- zoom  0 reset  np file  q quit",
+            "{name}  {place}  {:.0}%  hjkl pan  +- zoom  0 reset  tab file  q quit",
             view.zoom * 100.0
         ),
     };
@@ -1079,6 +1131,9 @@ fn decode_keys(buf: &[u8]) -> (Vec<Key>, usize) {
                 b'B' => keys.push(Key::Pan(0.0, PAN_STEP)),
                 b'C' => keys.push(Key::Pan(PAN_STEP, 0.0)),
                 b'D' => keys.push(Key::Pan(-PAN_STEP, 0.0)),
+
+                // shift-tab, which arrives as CSI Z
+                b'Z' => keys.push(Key::Prev),
                 _ => {}
             }
             i = end + 1;
@@ -1098,13 +1153,18 @@ fn decode_keys(buf: &[u8]) -> (Vec<Key>, usize) {
             b'+' | b'=' => keys.push(Key::Zoom(ZOOM_IN)),
             b'-' | b'_' => keys.push(Key::Zoom(ZOOM_OUT)),
             b'0' => keys.push(Key::Reset),
-            b'n' | b' ' => keys.push(Key::Next),
-            b'p' => keys.push(Key::Prev),
-            b'/' => keys.push(Key::Search),
-            b']' => keys.push(Key::Hit(1)),
-            b'[' => keys.push(Key::Hit(-1)),
+            b'n' => keys.push(Key::Hit(1)),
+            b'N' => keys.push(Key::Hit(-1)),
+            b'/' => keys.push(Key::Search(1)),
+            b'?' => keys.push(Key::Search(-1)),
             b'}' => keys.push(Key::Heading(1)),
             b'{' => keys.push(Key::Heading(-1)),
+
+            // g rather than gg, so that vim's own gg arrives
+            // as two jumps to the top and still lands there
+            b'g' => keys.push(Key::Top),
+            b'G' => keys.push(Key::Bottom),
+            0x09 => keys.push(Key::Next),
             _ => {}
         }
         i += 1;
@@ -1696,6 +1756,68 @@ mod tests {
     }
 
     #[test]
+    fn the_keys_are_the_ones_vim_uses() {
+        let keys = |b: &[u8]| decode_keys(b).0;
+
+        assert!(matches!(keys(b"n").as_slice(), [Key::Hit(1)]));
+        assert!(matches!(keys(b"N").as_slice(), [Key::Hit(-1)]));
+        assert!(matches!(keys(b"/").as_slice(), [Key::Search(1)]));
+        assert!(matches!(keys(b"?").as_slice(), [Key::Search(-1)]));
+        assert!(matches!(keys(b"}").as_slice(), [Key::Heading(1)]));
+        assert!(matches!(keys(b"{").as_slice(), [Key::Heading(-1)]));
+        assert!(matches!(keys(b"G").as_slice(), [Key::Bottom]));
+
+        // tab and shift-tab, the latter arriving as CSI Z
+        assert!(matches!(keys(b"\t").as_slice(), [Key::Next]));
+        assert!(matches!(keys(b"\x1b[Z").as_slice(), [Key::Prev]));
+    }
+
+    #[test]
+    fn vims_gg_lands_on_the_top_like_one_g_does() {
+        // g alone is the binding, so the second g of a habit
+        // jumps to a top it is already at
+        assert!(matches!(
+            decode_keys(b"gg").0.as_slice(),
+            [Key::Top, Key::Top]
+        ));
+    }
+
+    #[test]
+    fn the_keys_that_moved_mean_nothing_now() {
+        // p, space and the brackets were file and hit keys
+        for gone in [&b"p"[..], b" ", b"]", b"["] {
+            assert!(
+                decode_keys(gone).0.is_empty(),
+                "{:?} still does something",
+                gone
+            );
+        }
+    }
+
+    #[test]
+    fn a_search_starts_from_where_the_reader_is() {
+        // / from the middle of a page finds the next match
+        // below the window, not the first one in the document
+        let s = document(20.0);
+        let hits: Vec<source::Hit> = [4usize, 40, 120]
+            .iter()
+            .map(|&line| source::Hit {
+                line,
+                col: 0,
+                cols: 1,
+            })
+            .collect();
+
+        let mut v = View::reset(&s, (80, 25), CELL);
+        scroll_to(&mut v, &s, 700.0, (80, 25), CELL);
+
+        // the window top is at y=540, so forwards is the
+        // match on line 40 and backwards the one on line 4
+        assert_eq!(first_hit(&s, &v, &hits, 1, (80, 25), CELL), 1);
+        assert_eq!(first_hit(&s, &v, &hits, -1, (80, 25), CELL), 0);
+    }
+
+    #[test]
     fn a_lone_escape_quits() {
         assert!(matches!(keys_from(b"\x1b").as_slice(), [Key::Quit]));
     }
@@ -1718,7 +1840,7 @@ mod tests {
     fn a_key_before_a_split_sequence_still_registers() {
         // a burst cut mid sequence must not cost the keys ahead of the cut
         let (keys, used) = decode_keys(b"n\x1b[");
-        assert!(matches!(keys.as_slice(), [Key::Next]));
+        assert!(matches!(keys.as_slice(), [Key::Hit(1)]));
         assert_eq!(used, 1);
     }
 }
