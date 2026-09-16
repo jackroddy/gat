@@ -99,6 +99,22 @@ it is given, so its font size is derived from the width asked for rather than
 fixed. Scaling a long page down is never the answer: `geometry::fit` shrinks by
 the tighter axis, which would reduce a document until the text was unreadable.
 
+gat never opens a path that a document asks for. Markdown image syntax keeps
+its alt text and drops the destination, so viewing one file cannot make gat
+read another, or reach the network.
+
+This is what keeps `to_svg.rs` simple. Every attribute it writes is a number or
+a colour gat picked; text from the document reaches the SVG only as character
+data inside a `<text>` element, where `escape` handles it. Nothing from the
+input is pasted into an attribute, so there is no second place to get the
+escaping right.
+
+Images can be added later, behind a Cargo feature, but two things go first.
+`escape` has to cover `'`, because attributes here are single-quoted and a
+filename carrying an apostrophe would close one early and write its own markup.
+And the path rules have to be settled: files beside the document, no `..`
+climbing out, no network, and a cap on decoded size.
+
 The whole document is rasterized once, into memory, and the viewer transmits
 that page to the terminal a single time. Scrolling then sends a new source
 rectangle for the image the terminal already holds, which costs 69 bytes.
