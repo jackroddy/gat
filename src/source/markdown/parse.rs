@@ -118,6 +118,13 @@ pub fn parse(text: &str) -> Doc {
     // blockquote, which is where [!NOTE] arrives
     opts.insert(Options::ENABLE_GFM);
 
+    // front matter is a site generator's metadata rather
+    // than part of the document. parsing it is what allows
+    // it to be dropped: left off, the fence reads as a rule
+    // and the fields as a paragraph
+    opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    opts.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
+
     let mut b = Builder::default();
     for event in Parser::new_ext(text, opts) {
         b.event(event);
@@ -161,6 +168,9 @@ struct Builder {
 
     code: Option<String>,
 
+    /// Set between the front matter fences, where text is discarded.
+    meta: bool,
+
     /// Footnote labels in the order they were first referenced.
     //
     // the number a reader sees is this position, not the
@@ -185,6 +195,8 @@ impl Builder {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
+
+            Event::Text(_) if self.meta => {}
 
             // a fenced block arrives as several Text events and
             // must be rejoined before splitting on newlines
@@ -257,6 +269,7 @@ impl Builder {
                 self.where_ = Some(Inlines::ImageAlt);
                 self.alt.clear();
             }
+            Tag::MetadataBlock(_) => self.meta = true,
 
             Tag::Table(align) => {
                 self.table = Some(Table {
@@ -340,6 +353,8 @@ impl Builder {
                 self.inlines.push(Inline::Image { alt });
             }
 
+            TagEnd::MetadataBlock(_) => self.meta = false,
+
             TagEnd::TableCell => {
                 let cell = std::mem::take(&mut self.inlines);
                 self.where_ = None;
@@ -403,6 +418,28 @@ impl Builder {
     fn text(&mut self, t: &str, style: Style) {
         if self.where_ == Some(Inlines::ImageAlt) {
             self.alt.push_str(t);
+            return;
+        }
+
+        // a url inside a code span is not a link, and one
+        // inside a link already carries the style
+        if style.code || style.link {
+            self.run(t, style);
+            return;
+        }
+
+        let linked = Style { link: true, ..style };
+        let mut rest = t;
+        while let Some((before, url, after)) = split_url(rest) {
+            self.run(before, style);
+            self.run(url, linked);
+            rest = after;
+        }
+        self.run(rest, style);
+    }
+
+    fn run(&mut self, t: &str, style: Style) {
+        if t.is_empty() {
             return;
         }
         self.open_inlines();
@@ -479,6 +516,61 @@ impl Builder {
         out.sort_by_key(|f| f.number);
         out
     }
+}
+
+/// The next bare URL in `t`, split into what precedes it, the URL, and
+/// what follows.
+//
+// pulldown-cmark implements commonmark's angle autolinks
+// and not gfm's bare ones, so a plain https:// in prose
+// arrives as ordinary text and is found here instead
+fn split_url(t: &str) -> Option<(&str, &str, &str)> {
+    let mut from = 0;
+    while let Some(rel) = t[from..].find("http") {
+        let at = from + rel;
+
+        // `xhttps://` and `see:https://` are not links; a
+        // preceding letter or digit means this is the tail
+        // of some longer word
+        let edge = t[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+
+        if edge && (t[at..].starts_with("http://") || t[at..].starts_with("https://")) {
+            let run = &t[at..];
+            let run = &run[..run.find(char::is_whitespace).unwrap_or(run.len())];
+            let url = trim_url(run);
+            if !url.ends_with("://") {
+                let end = at + url.len();
+                return Some((&t[..at], &t[at..end], &t[end..]));
+            }
+        }
+        from = at + "http".len();
+    }
+    None
+}
+
+/// Drop the sentence punctuation a URL picks up from the prose around it.
+fn trim_url(url: &str) -> &str {
+    let mut end = url.len();
+    while let Some(c) = url[..end].chars().next_back() {
+        let drop = match c {
+            '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' => true,
+
+            // a closing bracket belongs to the url only if
+            // it matches one inside it, which is what keeps
+            // the tail of a _(disambiguation) link
+            ')' => url[..end].matches(')').count() > url[..end].matches('(').count(),
+            ']' => url[..end].matches(']').count() > url[..end].matches('[').count(),
+            _ => false,
+        };
+        if !drop {
+            break;
+        }
+        end -= c.len_utf8();
+    }
+    &url[..end]
 }
 
 fn callout(kind: BlockQuoteKind) -> Callout {
@@ -654,6 +746,29 @@ mod tests {
     }
 
     #[test]
+    fn front_matter_is_dropped() {
+        // the fences are a rule and the fields a paragraph
+        // if the metadata extensions are not enabled
+        let doc = parse("---\ntitle: x\ntags: [a, b]\n---\n\n# Heading\n");
+        assert_eq!(
+            doc.blocks,
+            vec![Block::Heading {
+                level: 1,
+                inlines: vec![plain("Heading", Style::default())],
+            }]
+        );
+    }
+
+    #[test]
+    fn toml_front_matter_is_dropped_too() {
+        let doc = parse("+++\ntitle = \"x\"\n+++\n\ntext\n");
+        assert_eq!(
+            doc.blocks,
+            vec![Block::Paragraph(vec![plain("text", Style::default())])]
+        );
+    }
+
+    #[test]
     fn a_task_item_records_whether_it_is_done() {
         let doc = parse("- [x] done\n- [ ] todo\n- plain\n");
         let Block::List { items, .. } = &doc.blocks[0] else {
@@ -686,6 +801,76 @@ mod tests {
             panic!("expected a quote");
         };
         assert_eq!(*callout, None);
+    }
+
+    #[test]
+    fn a_bare_url_is_styled_as_a_link() {
+        let linked = Style {
+            link: true,
+            ..Style::default()
+        };
+        let doc = parse("see https://example.com/a for more\n");
+        assert_eq!(
+            doc.blocks,
+            vec![Block::Paragraph(vec![
+                plain("see ", Style::default()),
+                plain("https://example.com/a", linked),
+                plain(" for more", Style::default()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_url_does_not_swallow_the_sentence_punctuation() {
+        // a full stop after a url is the prose's, and a
+        // closing bracket is the url's only if it opened one
+        assert_eq!(
+            split_url("at https://example.com/a."),
+            Some(("at ", "https://example.com/a", "."))
+        );
+        assert_eq!(
+            split_url("(https://example.com/a)"),
+            Some(("(", "https://example.com/a", ")"))
+        );
+        assert_eq!(
+            split_url("https://en.wikipedia.org/wiki/Foo_(bar)"),
+            Some(("", "https://en.wikipedia.org/wiki/Foo_(bar)", ""))
+        );
+    }
+
+    #[test]
+    fn a_url_needs_a_boundary_and_a_body() {
+        assert_eq!(split_url("xhttps://example.com"), None);
+        assert_eq!(split_url("https://"), None);
+        assert_eq!(split_url("ftp://example.com"), None);
+    }
+
+    #[test]
+    fn a_url_in_a_code_span_is_not_a_link() {
+        let code = Style {
+            code: true,
+            ..Style::default()
+        };
+        let doc = parse("`https://example.com`\n");
+        assert_eq!(
+            doc.blocks,
+            vec![Block::Paragraph(vec![plain("https://example.com", code)])]
+        );
+    }
+
+    #[test]
+    fn a_url_inside_a_real_link_is_not_split() {
+        // the link style is already set, so the scan is
+        // skipped and the text stays one run
+        let linked = Style {
+            link: true,
+            ..Style::default()
+        };
+        let doc = parse("[https://example.com](https://example.com)\n");
+        assert_eq!(
+            doc.blocks,
+            vec![Block::Paragraph(vec![plain("https://example.com", linked)])]
+        );
     }
 
     #[test]
