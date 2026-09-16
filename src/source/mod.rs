@@ -53,7 +53,37 @@ pub struct Index {
 pub struct Line {
     /// The top of the line, in framebuffer pixels.
     pub y: f32,
+
+    /// The left edge of the line, in framebuffer pixels.
+    pub x: f32,
+
+    /// The height of the line's box, in pixels.
+    //
+    // a heading's box is more than one row, and its text sits
+    // on the bottom of it, so the row to underline is the last
+    // one the box covers rather than the first
+    pub h: f32,
+
+    /// What one character of `text` advances by, in pixels.
+    //
+    // the page is monospace and gaps in `text` are padded to
+    // the columns they span, so the nth character of the line
+    // sits at x + n * advance
+    pub advance: f32,
     pub text: String,
+}
+
+/// Where one match of a search landed.
+#[derive(Debug, PartialEq)]
+pub struct Hit {
+    /// Index into `lines`.
+    pub line: usize,
+
+    /// Display columns from the start of that line.
+    pub col: usize,
+
+    /// Width of the match itself, in columns.
+    pub cols: usize,
 }
 
 #[derive(Debug)]
@@ -70,6 +100,9 @@ impl Index {
     pub fn scale(&mut self, k: f32) {
         for l in &mut self.lines {
             l.y *= k;
+            l.x *= k;
+            l.h *= k;
+            l.advance *= k;
         }
         for h in &mut self.outline {
             h.y *= k;
@@ -77,23 +110,48 @@ impl Index {
         self.row *= k;
     }
 
-    /// The top of every line holding `needle`, in order down the page.
+    /// Every match of `needle`, in order down the page.
     //
     // ascii case folding only: it is the one mapping that
     // cannot change a string's length, and anything else
-    // would need the match's byte offset translated back
-    pub fn find(&self, needle: &str) -> Vec<usize> {
+    // would move the byte offsets this counts columns from
+    pub fn find(&self, needle: &str) -> Vec<Hit> {
         if needle.is_empty() {
             return Vec::new();
         }
         let needle = needle.to_ascii_lowercase();
-        self.lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.text.to_ascii_lowercase().contains(&needle))
-            .map(|(i, _)| i)
-            .collect()
+        let cols = columns(&needle);
+
+        let mut out = Vec::new();
+        for (i, line) in self.lines.iter().enumerate() {
+            let hay = line.text.to_ascii_lowercase();
+            let mut from = 0;
+            while let Some(rel) = hay[from..].find(&needle) {
+                let at = from + rel;
+                out.push(Hit {
+                    line: i,
+                    col: columns(&hay[..at]),
+                    cols,
+                });
+                from = at + needle.len();
+            }
+        }
+        out
     }
+}
+
+/// How many terminal columns `s` occupies.
+//
+// the index is only ever built by the markdown renderer, so
+// the fallback is never the one measuring a real page
+#[cfg(feature = "markdown")]
+fn columns(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+#[cfg(not(feature = "markdown"))]
+fn columns(s: &str) -> usize {
+    s.chars().count()
 }
 
 /// A source as one or more images, stacked top to bottom.
@@ -265,6 +323,9 @@ mod tests {
                 .iter()
                 .map(|(y, text)| Line {
                     y: *y,
+                    x: 0.0,
+                    h: 10.0,
+                    advance: 10.0,
                     text: (*text).into(),
                 })
                 .collect(),
@@ -273,12 +334,35 @@ mod tests {
         }
     }
 
+    /// Just the lines the hits fell on.
+    fn on(hits: &[Hit]) -> Vec<usize> {
+        hits.iter().map(|h| h.line).collect()
+    }
+
     #[test]
     fn a_search_ignores_ascii_case_and_answers_in_page_order() {
         let ix = index(&[(0.0, "The Quick Fox"), (10.0, "a quick brown"), (20.0, "slow")]);
-        assert_eq!(ix.find("quick"), vec![0, 1]);
-        assert_eq!(ix.find("QUICK"), vec![0, 1]);
-        assert_eq!(ix.find("slow"), vec![2]);
+        assert_eq!(on(&ix.find("quick")), vec![0, 1]);
+        assert_eq!(on(&ix.find("QUICK")), vec![0, 1]);
+        assert_eq!(on(&ix.find("slow")), vec![2]);
+    }
+
+    #[test]
+    fn a_search_finds_every_match_on_a_line_with_its_column() {
+        let ix = index(&[(0.0, "one two one two")]);
+        let hits = ix.find("one");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0], Hit { line: 0, col: 0, cols: 3 });
+        assert_eq!(hits[1], Hit { line: 0, col: 8, cols: 3 });
+    }
+
+    #[test]
+    fn a_column_counts_display_width_not_bytes() {
+        // the page is a grid of columns, and a wide glyph
+        // takes two of them
+        let ix = index(&[(0.0, "\u{4e16}\u{754c} x")]);
+        let hits = ix.find("x");
+        assert_eq!(hits[0].col, 5, "two wide glyphs and a space");
     }
 
     #[test]

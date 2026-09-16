@@ -193,7 +193,7 @@ mod tests {
 
         let hits = ix.find("NEEDLE");
         assert_eq!(hits.len(), 1, "lines were {:?}", ix.lines);
-        let y = ix.lines[hits[0]].y;
+        let y = ix.lines[hits[0].line].y;
         assert!(
             y > 0.0 && y < loaded.fb.height() as f32,
             "hit at {y} is outside a page {} tall",

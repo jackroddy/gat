@@ -156,7 +156,7 @@ pub fn layout(doc: &Doc, theme: &Theme, width: f32) -> Page {
     Page {
         w: width,
         h: ((c.y + theme.margin) / row).ceil() * row,
-        lines: lines_of(&c.items),
+        lines: lines_of(&c.items, theme),
         outline: c.outline,
         items: c.items,
     }
@@ -173,7 +173,7 @@ fn baseline_in(top: f32, box_h: f32, size: f32) -> f32 {
 }
 
 /// Recover the page's text from what was drawn, one entry per line.
-fn lines_of(items: &[Item]) -> Vec<Line> {
+fn lines_of(items: &[Item], theme: &Theme) -> Vec<Line> {
     let mut runs: Vec<(f32, f32, f32, &str)> = items
         .iter()
         .filter_map(|i| match i {
@@ -191,15 +191,23 @@ fn lines_of(items: &[Item]) -> Vec<Line> {
         let advance = size * font::ADVANCE_RATIO;
         match out.last_mut() {
             Some(l) if (l.y - top).abs() < 0.5 => {
-                // a gap on the page is a gap in the text, so
-                // a table's columns do not run together
-                if x > end + advance / 2.0 {
+                l.h = l.h.max(theme.rows_for(size));
+
+                // padded to the columns the gap spans, not to
+                // one space: the nth character of the line has
+                // to sit where the nth column of the page does,
+                // or a match is highlighted in the wrong place
+                let gap = ((x - end) / advance).round().max(0.0) as usize;
+                for _ in 0..gap {
                     l.text.push(' ');
                 }
                 l.text.push_str(text);
             }
             _ => out.push(Line {
                 y: top,
+                x,
+                h: theme.rows_for(size),
+                advance,
                 text: text.to_owned(),
             }),
         }
@@ -972,12 +980,52 @@ mod tests {
     }
 
     #[test]
-    fn a_tables_columns_do_not_run_together_in_the_index() {
-        // the cells are drawn apart, so the text they yield
-        // has to be separated or a search spans the gap
+    fn a_line_reads_back_at_the_columns_it_was_drawn_at() {
+        // a gap pads to the columns it spans, so the nth
+        // character of the text is the nth column of the page
+        // and a match lands where the word is
         let page = page_of("| ab | cd |\n|----|----|\n| ef | gh |\n");
         let text: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
-        assert_eq!(text, vec!["ab cd", "ef gh"]);
+        assert_eq!(text, vec!["ab  cd", "ef  gh"], "TABLE_GAP is two columns");
+    }
+
+    #[test]
+    fn every_line_starts_on_a_column() {
+        // the same grid sideways: a hit is underlined in
+        // cells, so a line that starts a third of a character
+        // in is underlined a third of a character out
+        let page = page_of(concat!(
+            "# One\n\nbody text\n\n- a\n\n1. b\n\n```\ncode\n```\n\n",
+            "> quote\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\ntail[^n]\n\n[^n]: note\n",
+        ));
+        let advance = Theme::DARK.base_size * font::ADVANCE_RATIO;
+
+        for line in &page.lines {
+            let col = line.x / advance;
+            assert!(
+                (col - col.round()).abs() < 0.01,
+                "{:?} starts at column {col}",
+                line.text,
+            );
+        }
+    }
+
+    #[test]
+    fn a_headings_box_is_taller_than_a_body_line() {
+        // the viewer underlines the last row a box covers, so
+        // the box has to say how many rows that is
+        let page = page_of("# Title\n\nbody\n");
+        let row = Theme::DARK.row();
+        assert!(
+            (page.lines[0].h - 2.0 * row).abs() < 0.01,
+            "a heading box of {} is not two rows",
+            page.lines[0].h
+        );
+        assert!(
+            (page.lines[1].h - row).abs() < 0.01,
+            "a body box of {} is not one row",
+            page.lines[1].h
+        );
     }
 
     #[test]

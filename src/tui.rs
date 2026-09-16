@@ -188,7 +188,7 @@ fn event_loop(
     let mut query = String::new();
 
     // lines holding the current query, as indices into the page's own
-    let mut hits: Vec<usize> = Vec::new();
+    let mut hits: Vec<source::Hit> = Vec::new();
     let mut hit = 0usize;
 
     // shrunk on refusal, never below one viewport
@@ -444,7 +444,7 @@ fn document(shown: &Option<Shown>) -> bool {
 fn step(
     view: &mut View,
     shown: &Option<Shown>,
-    hits: &[usize],
+    hits: &[source::Hit],
     at: usize,
     query: &str,
     cells: (u32, u32),
@@ -459,7 +459,7 @@ fn step(
     if hits.is_empty() {
         return format!("/{query}  no matches");
     }
-    let line = &ix.lines[hits[at]];
+    let line = &ix.lines[hits[at].line];
     scroll_to(view, s, line.y, cells, cell);
     format!("/{query}  {}/{}  {}", at + 1, hits.len(), line.text.trim())
 }
@@ -964,6 +964,9 @@ mod tests {
             lines: (0..200)
                 .map(|i| source::Line {
                     y: i as f32 * row,
+                    x: 0.0,
+                    h: row,
+                    advance: CELL.w as f32,
                     text: format!("line {i}"),
                 })
                 .collect(),
