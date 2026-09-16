@@ -72,10 +72,18 @@ precedence.
 ## Design constraints
 
 Be stingy with dependencies, but not at the cost of the thing working out of
-the box. Every format ships in the default build, which costs 106 crates and a
-9.6M binary: hayro is most of the crates, resvg most of the rest, and markdown
+the box. Every format ships in the default build, which costs 115 crates and an
+11.8M binary: hayro is most of the crates, resvg most of the rest, and markdown
 adds only two beyond what resvg already dragged in, plus 1.2M of compiled-in
 font. For comparison, `--no-default-features` is 18 crates.
+
+Syntax colouring is 14 of those crates and 2.1M of that binary, which is why it
+carries a feature of its own. The alternative was a hand-written highlighter
+reading a table of keywords per language, which would have covered four
+languages and been wrong on the rest. syntect's syntax and theme dumps
+deserialize once behind a `OnceLock`, because each costs tens of milliseconds
+and a page can hold many blocks. A fence naming no language, or one syntect has
+no definition for, draws in the plain code colour.
 
 Each format is still a named feature, so the cost is refusable. But those names
 exist to be switched *off* with `--no-default-features`, not to be switched on:

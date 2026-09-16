@@ -4,6 +4,7 @@
 // out at the display width, drawn at 1:1, and cut off
 
 mod font;
+mod highlight;
 mod layout;
 mod parse;
 mod to_svg;

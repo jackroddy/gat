@@ -20,15 +20,17 @@ resvg = { version = "0.48", optional = true, default-features = false }
 pdfium-render = { version = "0.9", optional = true, default-features = false, features = ["image_025", "thread_safe", "pdfium_latest"] }
 pulldown-cmark = { version = "0.13", optional = true, default-features = false }
 unicode-width = { version = "0.2", optional = true }
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "parsing", "dump-load"], optional = true }
 
 [features]
-default = ["png", "jpeg", "pdf", "svg", "markdown"]
+default = ["png", "jpeg", "pdf", "svg", "markdown", "syntax"]
 png = ["image/png"]
 jpeg = ["image/jpeg"]
 svg = ["dep:resvg", "resvg/text"]
 pdf = ["dep:hayro"]
 pdf-pdfium = ["dep:pdfium-render"]
 markdown = ["dep:pulldown-cmark", "dep:unicode-width", "svg"]
+syntax = ["dep:syntect", "markdown"]
 
 [profile.release]
 opt-level = 3

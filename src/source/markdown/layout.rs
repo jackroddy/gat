@@ -4,6 +4,7 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::font;
+use super::highlight::{self, Span};
 use super::parse::{Align, Block, Callout, Cell, Doc, Footnote, Inline, ListItem, Style, Table};
 
 /// A colour, as red, green, blue.
@@ -158,7 +159,7 @@ impl Cursor<'_> {
             Block::Paragraph(inlines) => {
                 self.flow(inlines, x, w, self.theme.base_size, Style::default());
             }
-            Block::Code(lines) => self.code(lines, x, w),
+            Block::Code { lang, lines } => self.code(lang.as_deref(), lines, x, w),
             Block::Quote { callout, blocks } => self.quote(*callout, blocks, x, w),
             Block::List { start, items } => self.list(*start, items, x, w),
             Block::Footnotes(notes) => self.footnotes(notes, x, w),
@@ -211,7 +212,7 @@ impl Cursor<'_> {
         }
     }
 
-    fn code(&mut self, lines: &[String], x: f32, w: f32) {
+    fn code(&mut self, lang: Option<&str>, lines: &[String], x: f32, w: f32) {
         let size = self.theme.base_size;
         let advance = size * font::ADVANCE_RATIO;
         let line_h = size * self.theme.line_ratio;
@@ -220,9 +221,14 @@ impl Cursor<'_> {
 
         // code never soft-wraps: tabs expand to columns, then an
         // over-long line is broken onto further lines
-        let drawn: Vec<String> = lines
-            .iter()
-            .flat_map(|l| hard_split(&expand_tabs(l), cols))
+        //
+        // tabs go first: the highlighter is handed the text
+        // at the columns it will be drawn at, so a span's
+        // width is the width on the page
+        let expanded: Vec<String> = lines.iter().map(|l| expand_tabs(l)).collect();
+        let drawn: Vec<Vec<(usize, Span)>> = highlight::spans(lang, &expanded, self.theme.code_fg)
+            .into_iter()
+            .flat_map(|line| fold(line, cols))
             .collect();
 
         let h = drawn.len() as f32 * line_h + 2.0 * pad;
@@ -236,16 +242,19 @@ impl Cursor<'_> {
 
         let mut baseline = self.y + pad + size * font::ASCENT;
         for line in drawn {
-            if !line.is_empty() {
+            for (col, span) in line {
+                if span.text.is_empty() {
+                    continue;
+                }
                 self.items.push(Item::Run {
-                    x: x + pad,
+                    x: x + pad + col as f32 * advance,
                     baseline,
-                    text: line,
+                    text: span.text,
                     size,
                     bold: false,
                     italic: false,
                     strike: false,
-                    fill: self.theme.code_fg,
+                    fill: span.fill,
                 });
             }
             baseline += line_h;
@@ -453,6 +462,31 @@ impl Cursor<'_> {
             },
         );
     }
+}
+
+/// Break one source line's spans onto display lines of at most `cols`
+/// characters, each piece carrying the column it starts at.
+fn fold(spans: Vec<Span>, cols: usize) -> Vec<Vec<(usize, Span)>> {
+    let mut out = Vec::new();
+    let mut line: Vec<(usize, Span)> = Vec::new();
+    let mut col = 0usize;
+
+    for span in spans {
+        for chunk in hard_split(&span.text, cols) {
+            let width = chunk.width();
+            if col > 0 && col + width > cols {
+                out.push(std::mem::take(&mut line));
+                col = 0;
+            }
+            line.push((col, Span {
+                text: chunk,
+                fill: span.fill,
+            }));
+            col += width;
+        }
+    }
+    out.push(line);
+    out
 }
 
 /// Blank characters between one table column and the next.

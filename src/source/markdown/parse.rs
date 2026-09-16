@@ -17,7 +17,7 @@ pub enum Block {
     Heading { level: u8, inlines: Vec<Inline> },
     Paragraph(Vec<Inline>),
     /// Already split on newlines, with tabs still in place.
-    Code(Vec<String>),
+    Code { lang: Option<String>, lines: Vec<String> },
     List { start: Option<u64>, items: Vec<ListItem> },
     Quote { callout: Option<Callout>, blocks: Vec<Block> },
     /// Every footnote definition, in reference order, at the end of the document.
@@ -167,6 +167,7 @@ struct Builder {
     link: u32,
 
     code: Option<String>,
+    code_lang: Option<String>,
 
     /// Set between the front matter fences, where text is discarded.
     meta: bool,
@@ -248,7 +249,10 @@ impl Builder {
             Tag::Heading { level, .. } => {
                 self.where_ = Some(Inlines::Heading(heading_level(level)));
             }
-            Tag::CodeBlock(_) => self.code = Some(String::new()),
+            Tag::CodeBlock(kind) => {
+                self.code = Some(String::new());
+                self.code_lang = code_language(&kind);
+            }
             Tag::BlockQuote(kind) => {
                 self.opens.push(Open::Quote(kind.map(callout)));
                 self.levels.push(Vec::new());
@@ -316,7 +320,8 @@ impl Builder {
                 // a trailing newline is the fence's, not a blank last line
                 let body = body.strip_suffix('\n').unwrap_or(&body);
                 let lines = body.split('\n').map(str::to_owned).collect();
-                self.push(Block::Code(lines));
+                let lang = self.code_lang.take();
+                self.push(Block::Code { lang, lines });
             }
             TagEnd::BlockQuote(_) => {
                 let blocks = self.levels.pop().unwrap_or_default();
@@ -603,9 +608,7 @@ fn heading_level(level: HeadingLevel) -> u8 {
 }
 
 /// The language tag on a fenced code block, if it has one.
-#[allow(dead_code)]
 fn code_language(kind: &CodeBlockKind<'_>) -> Option<String> {
-    // TODO: nothing calls this until code blocks are coloured
     match kind {
         CodeBlockKind::Fenced(lang) if !lang.is_empty() => Some(lang.to_string()),
         _ => None,
@@ -674,11 +677,22 @@ mod tests {
         let doc = parse("```rust\nfn main() {\n    ok();\n}\n```\n");
         assert_eq!(
             doc.blocks,
-            vec![Block::Code(vec![
-                "fn main() {".into(),
-                "    ok();".into(),
-                "}".into(),
-            ])]
+            vec![Block::Code {
+                lang: Some("rust".into()),
+                lines: vec!["fn main() {".into(), "    ok();".into(), "}".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_fence_with_no_info_string_names_no_language() {
+        let doc = parse("```\nplain\n```\n");
+        assert_eq!(
+            doc.blocks,
+            vec![Block::Code {
+                lang: None,
+                lines: vec!["plain".into()],
+            }]
         );
     }
 
