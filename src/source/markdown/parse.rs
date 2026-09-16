@@ -20,6 +20,8 @@ pub enum Block {
     Code(Vec<String>),
     List { start: Option<u64>, items: Vec<ListItem> },
     Quote { callout: Option<Callout>, blocks: Vec<Block> },
+    /// Every footnote definition, in reference order, at the end of the document.
+    Footnotes(Vec<Footnote>),
     Table(Table),
     Rule,
 }
@@ -41,6 +43,13 @@ pub enum Align {
     Left,
     Center,
     Right,
+}
+
+/// One footnote definition, numbered by where it was first referenced.
+#[derive(Debug, PartialEq)]
+pub struct Footnote {
+    pub number: usize,
+    pub blocks: Vec<Block>,
 }
 
 /// One item of a list, and whether it carried a task checkbox.
@@ -83,6 +92,9 @@ pub enum Inline {
 
     /// Rendered as its alt text.
     Image { alt: String },
+
+    /// A footnote reference, drawn as its number in brackets.
+    Note { number: usize },
     Break,
 }
 
@@ -100,6 +112,7 @@ pub fn parse(text: &str) -> Doc {
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_FOOTNOTES);
 
     // the only GFM extra this asks for is the kind on a
     // blockquote, which is where [!NOTE] arrives
@@ -115,6 +128,7 @@ pub fn parse(text: &str) -> Doc {
 /// What sort of container is open, for the block stack to close back into.
 enum Open {
     Quote(Option<Callout>),
+    Note(String),
     List { start: Option<u64>, items: Vec<ListItem> },
     Item { task: Option<bool> },
 }
@@ -146,6 +160,16 @@ struct Builder {
     link: u32,
 
     code: Option<String>,
+
+    /// Footnote labels in the order they were first referenced.
+    //
+    // the number a reader sees is this position, not the
+    // label: `[^impl]` and `[^1]` both number from one, in
+    // the order the prose reaches them
+    notes: Vec<String>,
+
+    /// Definitions collected out of the flow, to be placed at the end.
+    defs: Vec<(String, Vec<Block>)>,
 
     table: Option<Table>,
 
@@ -187,6 +211,12 @@ impl Builder {
             }
 
             Event::Rule => self.push(Block::Rule),
+
+            Event::FootnoteReference(label) => {
+                let number = self.note_number(&label);
+                self.open_inlines();
+                self.inlines.push(Inline::Note { number });
+            }
 
             // the marker arrives inside the item it belongs
             // to, so it is recorded on the open item rather
@@ -238,6 +268,14 @@ impl Builder {
             // a cell's content arrives as ordinary inlines,
             // so it needs somewhere for them to land
             Tag::TableCell => self.where_ = Some(Inlines::Paragraph),
+
+            // a definition is written wherever the author
+            // put it and read at the end, so its blocks are
+            // diverted rather than pushed
+            Tag::FootnoteDefinition(label) => {
+                self.opens.push(Open::Note(label.to_string()));
+                self.levels.push(Vec::new());
+            }
             _ => {}
         }
     }
@@ -327,8 +365,29 @@ impl Builder {
                     self.push(Block::Table(t));
                 }
             }
+
+            TagEnd::FootnoteDefinition => {
+                self.flush_loose_inlines();
+                let blocks = self.levels.pop().unwrap_or_default();
+                if let Some(Open::Note(label)) = self.opens.pop() {
+                    self.defs.push((label, blocks));
+                }
+            }
             _ => {}
         }
+    }
+
+    /// The number `label` is drawn as, assigning the next one if it is new.
+    fn note_number(&mut self, label: &str) -> usize {
+        let at = self
+            .notes
+            .iter()
+            .position(|n| n == label)
+            .unwrap_or_else(|| {
+                self.notes.push(label.to_owned());
+                self.notes.len() - 1
+            });
+        at + 1
     }
 
     fn style(&self) -> Style {
@@ -398,9 +457,27 @@ impl Builder {
                 }
             }
         }
-        Doc {
-            blocks: self.levels.pop().unwrap_or_default(),
+        let footnotes = self.footnotes();
+        let mut blocks = self.levels.pop().unwrap_or_default();
+        if !footnotes.is_empty() {
+            blocks.push(Block::Rule);
+            blocks.push(Block::Footnotes(footnotes));
         }
+        Doc { blocks }
+    }
+
+    /// The definitions in reference order, with any never referenced last.
+    fn footnotes(&mut self) -> Vec<Footnote> {
+        let defs = std::mem::take(&mut self.defs);
+        let mut out: Vec<Footnote> = defs
+            .into_iter()
+            .map(|(label, blocks)| Footnote {
+                number: self.note_number(&label),
+                blocks,
+            })
+            .collect();
+        out.sort_by_key(|f| f.number);
+        out
     }
 }
 
@@ -609,6 +686,42 @@ mod tests {
             panic!("expected a quote");
         };
         assert_eq!(*callout, None);
+    }
+
+    #[test]
+    fn footnotes_are_numbered_by_first_reference_and_moved_to_the_end() {
+        // the definitions are written in the other order, so
+        // this fails if numbering follows the definitions
+        let doc = parse("see[^z] and[^a]\n\n[^a]: alpha\n[^z]: zulu\n");
+
+        let Block::Paragraph(inlines) = &doc.blocks[0] else {
+            panic!("expected a paragraph, got {:?}", doc.blocks[0]);
+        };
+        let numbers: Vec<_> = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Note { number } => Some(*number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(numbers, vec![1, 2]);
+
+        assert_eq!(doc.blocks[1], Block::Rule);
+        let Block::Footnotes(notes) = &doc.blocks[2] else {
+            panic!("expected footnotes, got {:?}", doc.blocks[2]);
+        };
+        assert_eq!(notes[0].number, 1);
+        assert_eq!(
+            notes[0].blocks,
+            vec![Block::Paragraph(vec![plain("zulu", Style::default())])]
+        );
+        assert_eq!(notes[1].number, 2);
+    }
+
+    #[test]
+    fn a_document_without_footnotes_gains_no_rule() {
+        let doc = parse("just text\n");
+        assert_eq!(doc.blocks.len(), 1);
     }
 
     #[test]

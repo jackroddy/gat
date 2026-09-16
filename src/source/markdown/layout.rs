@@ -4,7 +4,7 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::font;
-use super::parse::{Align, Block, Callout, Cell, Doc, Inline, ListItem, Style, Table};
+use super::parse::{Align, Block, Callout, Cell, Doc, Footnote, Inline, ListItem, Style, Table};
 
 /// A colour, as red, green, blue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +161,7 @@ impl Cursor<'_> {
             Block::Code(lines) => self.code(lines, x, w),
             Block::Quote { callout, blocks } => self.quote(*callout, blocks, x, w),
             Block::List { start, items } => self.list(*start, items, x, w),
+            Block::Footnotes(notes) => self.footnotes(notes, x, w),
             Block::Table(t) => self.table(t, x, w),
             Block::Rule => {
                 let size = self.theme.base_size;
@@ -295,7 +296,6 @@ impl Cursor<'_> {
 
     fn list(&mut self, start: Option<u64>, items: &[ListItem], x: f32, w: f32) {
         let size = self.theme.base_size;
-        let advance = size * font::ADVANCE_RATIO;
 
         for (i, item) in items.iter().enumerate() {
             if i > 0 {
@@ -310,28 +310,7 @@ impl Cursor<'_> {
                 (None, Some(n)) => format!("{}.", n + i as u64),
                 (None, None) => "\u{2022}".to_owned(),
             };
-            let indent = (marker.width() + 1) as f32 * advance;
-
-            // the marker sits on the first line's baseline, which
-            // exists only once the body has been placed
-            let at = self.items.len();
-            let y0 = self.y;
-            self.blocks(&item.blocks, x + indent, (w - indent).max(1.0));
-
-            let baseline = y0 + size * font::ASCENT;
-            self.items.insert(
-                at,
-                Item::Run {
-                    x,
-                    baseline,
-                    text: marker,
-                    size,
-                    bold: false,
-                    italic: false,
-                    strike: false,
-                    fill: self.theme.dim,
-                },
-            );
+            self.marked(marker, &item.blocks, x, w);
         }
     }
 
@@ -435,6 +414,44 @@ impl Cursor<'_> {
             }
             self.y += line_h;
         }
+    }
+
+    fn footnotes(&mut self, notes: &[Footnote], x: f32, w: f32) {
+        let size = self.theme.base_size;
+        for (i, note) in notes.iter().enumerate() {
+            if i > 0 {
+                self.y += size * 0.3;
+            }
+            self.marked(format!("{}.", note.number), &note.blocks, x, w);
+        }
+    }
+
+    /// Draw `blocks` indented past `marker`, with the marker on the first
+    /// line's baseline.
+    fn marked(&mut self, marker: String, blocks: &[Block], x: f32, w: f32) {
+        let size = self.theme.base_size;
+        let advance = size * font::ADVANCE_RATIO;
+        let indent = (marker.width() + 1) as f32 * advance;
+
+        // the marker sits on the first line's baseline, which
+        // exists only once the body has been placed
+        let at = self.items.len();
+        let y0 = self.y;
+        self.blocks(blocks, x + indent, (w - indent).max(1.0));
+
+        self.items.insert(
+            at,
+            Item::Run {
+                x,
+                baseline: y0 + size * font::ASCENT,
+                text: marker,
+                size,
+                bold: false,
+                italic: false,
+                strike: false,
+                fill: self.theme.dim,
+            },
+        );
     }
 }
 
@@ -591,6 +608,16 @@ fn tokens(inlines: &[Inline], base: Style) -> Vec<Tok> {
                         italic: true,
                         ..base
                     },
+                    space_before: gap,
+                });
+                gap = false;
+            }
+            // the link colour, because a reference points
+            // somewhere and Style carries no dim of its own
+            Inline::Note { number } => {
+                out.push(Tok::Word {
+                    text: format!("[{number}]"),
+                    style: Style { link: true, ..base },
                     space_before: gap,
                 });
                 gap = false;
