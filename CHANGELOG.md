@@ -1,0 +1,63 @@
+# Changelog
+
+This file records every notable change to gat.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Nothing has been released yet, so everything so far sits under Unreleased.
+
+## [Unreleased]
+
+### Added
+
+- Show PNG, JPEG, PDF, SVG and Markdown in a terminal that speaks the Kitty
+  graphics protocol. PDF goes through hayro by default, or pdfium behind the
+  `pdf-pdfium` feature.
+- A viewer on the alternate screen that pans, and zooms a picture. It transmits
+  a page once and scrolls by asking the terminal for a different part of the
+  pixels it already holds, so a keypress costs 69 bytes.
+- `--print`, which writes an image where the cursor is and exits. It runs
+  whether or not stdout is a terminal, so pipes and redirects work.
+- Markdown drawn as a page: headings at real sizes, tables, task lists,
+  footnotes, GitHub callouts, block quotes, and code blocks coloured by
+  language through syntect, behind the `syntax` feature.
+- Search in the viewer. gat underlines the matches over the page as terminal
+  text, which costs no pixels, and steps through headings the same way.
+- Vim's keys: `hjkl` and the arrows pan, `g` and `G` are the ends, `/` and `?`
+  search, `n` and `N` step matches, `}` and `{` step headings, tab and
+  shift-tab change file.
+- `--keep`, which leaves the images of earlier runs in the terminal.
+- `--probe`, which reports what terminal detection saw.
+- Terminal detection over ssh. It sizes its waits from one measured round trip
+  instead of a fixed timeout.
+
+### Changed
+
+- gat lays a markdown page out on the terminal's own grid. Every line box is a
+  whole number of rows and starts on a whole column, and the type sits on the
+  baseline the terminal draws its own text on.
+- gat draws a document at 1:1 and scrolls it by whole rows. Only pictures zoom
+  now, since magnifying a rasterized page returns the same words larger.
+- `--print` draws its ids from one reserved block and clears that block before
+  it starts, so a run replaces the images of the run before it. A terminal no
+  longer holds every image it has ever been sent.
+- The viewer sends a page in bands, each transmitted once. Panning still costs
+  one placement, or two across a seam.
+
+### Fixed
+
+- A long document drew as a blank page under herdr, which drops an image whose
+  estimated size passes 30 MiB and reports nothing, in its protocol or its log.
+  Bands keep every image well under that.
+- A page could pass the 10000 pixel side limit that kitty, Ghostty and herdr
+  all enforce. No terminal would have drawn it.
+
+### Security
+
+- A filename or a decoder's error can no longer write escape sequences to the
+  terminal. gat drops control characters from the status line, C1 included.
+- A document cannot name a file. Markdown image syntax keeps its alt text and
+  discards the destination, so viewing one file cannot make gat read another or
+  reach the network.
+- Text from a document reaches the SVG only as character data, escaped, and
+  nothing a document contains is written to the terminal as characters.
