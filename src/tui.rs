@@ -497,7 +497,14 @@ fn spinner_text(files: &[PathBuf], index: usize, began: Instant) -> String {
 fn status_line(out: &mut impl Write, cells: (u32, u32), text: &str) -> std::io::Result<()> {
     write!(out, "\x1b[{};1H\x1b[K", cells.1)?;
     let width = cells.0 as usize;
-    out.write_all(text.chars().take(width).collect::<String>().as_bytes())
+
+    // the line carries a filename and a decoder's error
+    // string, neither of which gat chose: a name may
+    // legally hold ESC, and writing it back would run
+    // whatever sequence it spells. is_control covers C1 as
+    // well, which an 8-bit CSI would otherwise slip through
+    let drawn: String = text.chars().filter(|c| !c.is_control()).take(width).collect();
+    out.write_all(drawn.as_bytes())
 }
 
 /// The terminal's complaint about a graphics command, if `buf` holds one.
@@ -622,6 +629,31 @@ mod tests {
 
     fn view(zoom: f64, cx: f64, cy: f64) -> View {
         View { zoom, cx, cy }
+    }
+
+    /// What `status_line` drew, with its own positioning prefix removed.
+    fn drawn(text: &str) -> String {
+        let mut out = Vec::new();
+        status_line(&mut out, (80, 24), text).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        s.strip_prefix("\x1b[24;1H\x1b[K").unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_filename_cannot_write_escape_sequences_to_the_terminal() {
+        // a name holding ESC is legal on disk, and reaches
+        // here from a glob rather than from anything typed
+        assert_eq!(drawn("evil\x1b[2Jname.md"), "evil[2Jname.md");
+        assert_eq!(drawn("bel\x07and\x00nul"), "belandnul");
+
+        // C1 CSI is a single byte and opens a sequence too
+        assert_eq!(drawn("eight\u{9b}bit"), "eightbit");
+    }
+
+    #[test]
+    fn the_status_line_keeps_ordinary_text_and_the_width_limit() {
+        assert_eq!(drawn("notes.md  [1/3]"), "notes.md  [1/3]");
+        assert_eq!(drawn(&"x".repeat(200)).len(), 80);
     }
 
     #[test]
