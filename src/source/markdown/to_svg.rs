@@ -49,6 +49,7 @@ pub fn emit(page: &Page, bg: Rgb, from_y: f32, h: f32) -> String {
                 italic,
                 strike,
                 fill,
+                ..
             } => {
                 let _ = write!(s, "<text x='{x}' y='{baseline}' font-size='{size}'");
                 if *bold {

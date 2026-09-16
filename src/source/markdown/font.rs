@@ -29,6 +29,14 @@ pub const ADVANCE_RATIO: f32 = 1229.0 / 2048.0;
 /// Ascent as a fraction of the em, from hhea.
 pub const ASCENT: f32 = 1705.0 / 2048.0;
 
+/// Descent as a fraction of the em, from hhea's descender of -615.
+//
+// ASCENT + DESCENT is 1.133 em, so the ink of a line is
+// taller than its type size and a row has to be at least
+// that much taller again before the text can be moved down
+// inside it
+pub const DESCENT: f32 = 615.0 / 2048.0;
+
 /// Options with the four faces loaded and the family set as the default.
 pub fn options() -> usvg::Options<'static> {
     let mut opt = usvg::Options {

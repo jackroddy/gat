@@ -35,6 +35,13 @@ pub enum Item {
     },
     Run {
         x: f32,
+
+        /// Top of the line box this run sits in.
+        //
+        // the baseline alone does not give it back, because
+        // where the baseline sits inside the box depends on
+        // how much taller than the type the box is
+        top: f32,
         baseline: f32,
         text: String,
         size: f32,
@@ -83,6 +90,24 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// One terminal row, in pixels.
+    //
+    // theme_for sets line_ratio to cell.h / base_size, so a
+    // body line box is exactly the cell. every vertical step
+    // on the page is a whole number of these, which is what
+    // lets the viewer address a line by its row
+    pub fn row(&self) -> f32 {
+        self.base_size * self.line_ratio
+    }
+
+    /// The line box for type of `size`, rounded up to whole rows.
+    pub fn rows_for(&self, size: f32) -> f32 {
+        // the epsilon is what keeps a heading at exactly
+        // twice the body size from computing 2.0000002 and
+        // taking three rows
+        ((size / self.base_size) - 1e-3).ceil().max(1.0) * self.row()
+    }
+
     pub const DARK: Theme = Theme {
         bg: Rgb(0x1e, 0x1e, 0x1e),
         fg: Rgb(0xd4, 0xd4, 0xd4),
@@ -111,22 +136,40 @@ impl Theme {
 
 /// Lay `doc` out into a page exactly `width` pixels across.
 pub fn layout(doc: &Doc, theme: &Theme, width: f32) -> Page {
+    // the margins round up to whole rows and whole characters
+    // so that y = 0 is a row boundary and x = 0 is a column:
+    // the page's columns have to be the terminal's columns as
+    // much as its rows do
+    let row = theme.row();
+    let advance = theme.base_size * font::ADVANCE_RATIO;
+    let left = (theme.margin / advance).ceil() * advance;
+
     let mut c = Cursor {
         theme,
-        y: theme.margin,
+        y: (theme.margin / row).ceil() * row,
         items: Vec::new(),
         outline: Vec::new(),
     };
-    let content_w = (width - 2.0 * theme.margin).max(1.0);
-    c.blocks(&doc.blocks, theme.margin, content_w);
+    let content_w = (width - 2.0 * left).max(1.0);
+    c.blocks(&doc.blocks, left, content_w);
 
     Page {
         w: width,
-        h: c.y + theme.margin,
+        h: ((c.y + theme.margin) / row).ceil() * row,
         lines: lines_of(&c.items),
         outline: c.outline,
         items: c.items,
     }
+}
+
+/// Where the baseline goes for type of `size` in a box `box_h` tall.
+//
+// the ink box is ASCENT + DESCENT, sat on the bottom of the
+// row so the page shares the baseline the terminal draws its
+// own text on. that is what puts an underline under the word
+// rather than most of a row below it
+fn baseline_in(top: f32, box_h: f32, size: f32) -> f32 {
+    top + (box_h - size * font::DESCENT).max(size * font::ASCENT)
 }
 
 /// Recover the page's text from what was drawn, one entry per line.
@@ -135,12 +178,8 @@ fn lines_of(items: &[Item]) -> Vec<Line> {
         .iter()
         .filter_map(|i| match i {
             Item::Run {
-                x,
-                baseline,
-                size,
-                text,
-                ..
-            } => Some((*baseline, *x, *size, text.as_str())),
+                x, top, size, text, ..
+            } => Some((*top, *x, *size, text.as_str())),
             Item::Rect { .. } => None,
         })
         .collect();
@@ -148,9 +187,8 @@ fn lines_of(items: &[Item]) -> Vec<Line> {
 
     let mut out: Vec<Line> = Vec::new();
     let mut end = 0.0f32;
-    for (baseline, x, size, text) in runs {
+    for (top, x, size, text) in runs {
         let advance = size * font::ADVANCE_RATIO;
-        let top = baseline - size * font::ASCENT;
         match out.last_mut() {
             Some(l) if (l.y - top).abs() < 0.5 => {
                 // a gap on the page is a gap in the text, so
@@ -181,9 +219,7 @@ impl Cursor<'_> {
     fn blocks(&mut self, blocks: &[Block], x: f32, w: f32) {
         for (i, b) in blocks.iter().enumerate() {
             if i > 0 {
-                // TODO: this and the other spacing multipliers
-                //       in this impl were eyeballed
-                self.y += self.theme.base_size * 0.6;
+                self.y += self.theme.row();
             }
             self.block(b, x, w);
         }
@@ -198,7 +234,7 @@ impl Cursor<'_> {
 
                 // space above a heading, but not at the top of a page
                 if self.y > self.theme.margin {
-                    self.y += size * 0.4;
+                    self.y += self.theme.row();
                 }
                 let style = Style {
                     bold: true,
@@ -220,16 +256,15 @@ impl Cursor<'_> {
             Block::Footnotes(notes) => self.footnotes(notes, x, w),
             Block::Table(t) => self.table(t, x, w),
             Block::Rule => {
-                let size = self.theme.base_size;
-                self.y += size * 0.5;
+                let row = self.theme.row();
                 self.items.push(Item::Rect {
                     x,
-                    y: self.y,
+                    y: self.y + (row / 2.0).round(),
                     w,
                     h: 1.0,
                     fill: self.theme.rule,
                 });
-                self.y += size * 0.5 + 1.0;
+                self.y += row;
             }
         }
     }
@@ -237,13 +272,18 @@ impl Cursor<'_> {
     fn flow(&mut self, inlines: &[Inline], x: f32, w: f32, size: f32, base: Style) {
         let advance = size * font::ADVANCE_RATIO;
         let cols = ((w / advance).floor() as usize).max(1);
-        let line_h = size * self.theme.line_ratio;
+
+        // a heading's glyphs may be any size; its line box
+        // rounds up to whole rows so the text below it stays
+        // on the grid
+        let line_h = self.theme.rows_for(size);
 
         for line in wrap(inlines, cols, base) {
-            let baseline = self.y + size * font::ASCENT;
+            let baseline = baseline_in(self.y, line_h, size);
             for piece in line {
                 self.items.push(Item::Run {
                     x: x + piece.col as f32 * advance,
+                    top: self.y,
                     baseline,
                     size,
                     bold: piece.style.bold,
@@ -270,9 +310,13 @@ impl Cursor<'_> {
     fn code(&mut self, lang: Option<&str>, lines: &[String], x: f32, w: f32) {
         let size = self.theme.base_size;
         let advance = size * font::ADVANCE_RATIO;
-        let line_h = size * self.theme.line_ratio;
-        let pad = size * 0.5;
-        let cols = ((w - 2.0 * pad) / advance).floor().max(1.0) as usize;
+        let line_h = self.theme.row();
+
+        // a row down and two characters in, because the text
+        // inside has to land on the grid in both directions
+        let pad_y = line_h;
+        let pad_x = 2.0 * advance;
+        let cols = ((w - 2.0 * pad_x) / advance).floor().max(1.0) as usize;
 
         // code never soft-wraps: tabs expand to columns, then an
         // over-long line is broken onto further lines
@@ -286,7 +330,7 @@ impl Cursor<'_> {
             .flat_map(|line| fold(line, cols))
             .collect();
 
-        let h = drawn.len() as f32 * line_h + 2.0 * pad;
+        let h = drawn.len() as f32 * line_h + 2.0 * pad_y;
         self.items.push(Item::Rect {
             x,
             y: self.y,
@@ -295,15 +339,16 @@ impl Cursor<'_> {
             fill: self.theme.code_bg,
         });
 
-        let mut baseline = self.y + pad + size * font::ASCENT;
+        let mut top = self.y + pad_y;
         for line in drawn {
             for (col, span) in line {
                 if span.text.is_empty() {
                     continue;
                 }
                 self.items.push(Item::Run {
-                    x: x + pad + col as f32 * advance,
-                    baseline,
+                    x: x + pad_x + col as f32 * advance,
+                    top,
+                    baseline: baseline_in(top, line_h, size),
                     text: span.text,
                     size,
                     bold: false,
@@ -312,7 +357,7 @@ impl Cursor<'_> {
                     fill: span.fill,
                 });
             }
-            baseline += line_h;
+            top += line_h;
         }
         self.y += h;
     }
@@ -333,7 +378,8 @@ impl Cursor<'_> {
         if let Some(c) = callout {
             self.items.push(Item::Run {
                 x: x + indent,
-                baseline: self.y + size * font::ASCENT,
+                top: self.y,
+                baseline: baseline_in(self.y, self.theme.row(), size),
                 text: c.label().to_owned(),
                 size,
                 bold: true,
@@ -341,7 +387,7 @@ impl Cursor<'_> {
                 strike: false,
                 fill: bar,
             });
-            self.y += size * self.theme.line_ratio;
+            self.y += self.theme.row();
         }
 
         self.blocks(inner, x + indent, (w - indent).max(1.0));
@@ -359,12 +405,7 @@ impl Cursor<'_> {
     }
 
     fn list(&mut self, start: Option<u64>, items: &[ListItem], x: f32, w: f32) {
-        let size = self.theme.base_size;
-
         for (i, item) in items.iter().enumerate() {
-            if i > 0 {
-                self.y += size * 0.3;
-            }
             // squares, not U+2610 BALLOT BOX: Liberation
             // Mono has no ballot box and no check mark, and
             // a missing glyph draws as nothing at all
@@ -413,15 +454,15 @@ impl Cursor<'_> {
             };
             self.table_row(&t.head, &widths, &starts, &t.align, x, bold);
 
-            self.y += size * 0.2;
+            let row = self.theme.row();
             self.items.push(Item::Rect {
                 x,
-                y: self.y,
+                y: self.y + (row / 2.0).round(),
                 w: span as f32 * advance,
                 h: 1.0,
                 fill: self.theme.rule,
             });
-            self.y += 1.0 + size * 0.2;
+            self.y += row;
         }
 
         for row in &t.rows {
@@ -441,7 +482,7 @@ impl Cursor<'_> {
     ) {
         let size = self.theme.base_size;
         let advance = size * font::ADVANCE_RATIO;
-        let line_h = size * self.theme.line_ratio;
+        let line_h = self.theme.row();
 
         let wrapped: Vec<Vec<Vec<Piece>>> = cells
             .iter()
@@ -453,7 +494,7 @@ impl Cursor<'_> {
         let height = wrapped.iter().map(Vec::len).max().unwrap_or(0);
 
         for j in 0..height {
-            let baseline = self.y + size * font::ASCENT;
+            let baseline = baseline_in(self.y, line_h, size);
             for (i, lines) in wrapped.iter().enumerate() {
                 let Some(line) = lines.get(j) else { continue };
                 let width = widths.get(i).copied().unwrap_or(1);
@@ -466,6 +507,7 @@ impl Cursor<'_> {
                 for piece in line {
                     self.items.push(Item::Run {
                         x: x + (starts[i] + pad + piece.col) as f32 * advance,
+                        top: self.y,
                         baseline,
                         size,
                         bold: piece.style.bold,
@@ -481,11 +523,7 @@ impl Cursor<'_> {
     }
 
     fn footnotes(&mut self, notes: &[Footnote], x: f32, w: f32) {
-        let size = self.theme.base_size;
-        for (i, note) in notes.iter().enumerate() {
-            if i > 0 {
-                self.y += size * 0.3;
-            }
+        for note in notes {
             self.marked(format!("{}.", note.number), &note.blocks, x, w);
         }
     }
@@ -507,7 +545,8 @@ impl Cursor<'_> {
             at,
             Item::Run {
                 x,
-                baseline: y0 + size * font::ASCENT,
+                top: y0,
+                baseline: baseline_in(y0, self.theme.row(), size),
                 text: marker,
                 size,
                 bold: false,
@@ -815,6 +854,100 @@ mod tests {
 
     fn page_of(md: &str) -> Page {
         layout(&super::super::parse::parse(md), &Theme::DARK, 600.0)
+    }
+
+    #[test]
+    fn every_line_lands_on_the_row_grid() {
+        // the viewer addresses a line by its terminal row, so
+        // one line box that is not a whole number of rows puts
+        // every line below it between two cells
+        let page = page_of(concat!(
+            "# One\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five\n\n",
+            "body text that is long enough to wrap onto a second line somewhere\n\n",
+            "- a\n- b\n  - nested\n\n1. first\n2. second\n\n",
+            "```\ncode\nmore code\n```\n\n---\n\n> quote\n\n> [!NOTE]\n> callout\n\n",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n\ntail[^n]\n\n[^n]: note\n",
+        ));
+
+        let theme = Theme::DARK;
+        let row = theme.row();
+        assert!(
+            page.lines.len() >= 20,
+            "expected a full page, got {}",
+            page.lines.len()
+        );
+
+        // the origin rounds up to a row too, so the whole
+        // coordinate system counts from zero in rows
+        for line in &page.lines {
+            let off = line.y / row;
+            assert!(
+                (off - off.round()).abs() < 0.01,
+                "{:?} sits {off} rows down the page",
+                line.text,
+            );
+        }
+        let h = page.h / row;
+        assert!((h - h.round()).abs() < 0.01, "page is {h} rows tall");
+    }
+
+    #[test]
+    fn the_page_starts_on_a_row_and_on_a_column() {
+        // the margins round up in both directions, so the
+        // first thing drawn is already on the grid
+        let page = page_of("body text\n");
+        let theme = Theme::DARK;
+        let advance = theme.base_size * font::ADVANCE_RATIO;
+
+        let Item::Run { x, top, .. } = &page.items[0] else {
+            panic!("expected a run, got {:?}", page.items[0]);
+        };
+        let col = x / advance;
+        let row = top / theme.row();
+        assert!((col - col.round()).abs() < 0.01, "starts at column {col}");
+        assert!((row - row.round()).abs() < 0.01, "starts at row {row}");
+    }
+
+    #[test]
+    fn the_ink_of_a_line_sits_inside_its_box() {
+        // moved down so an underline lands under the word,
+        // but not so far that a descender reaches the row below
+        let theme = Theme::DARK;
+        for scale in [1.0, 1.15, 1.6, 2.0] {
+            let size = theme.base_size * scale;
+            let box_h = theme.rows_for(size);
+            let b = baseline_in(0.0, box_h, size);
+
+            assert!(
+                b - size * font::ASCENT >= -0.01,
+                "scale {scale} clips the ascent"
+            );
+            assert!(
+                b + size * font::DESCENT <= box_h + 0.01,
+                "scale {scale} drops a descender into the next row"
+            );
+        }
+    }
+
+    #[test]
+    fn a_box_too_tight_for_the_ink_keeps_the_ascent() {
+        // a cell shorter than the ink cannot hold both ends,
+        // and losing the top of the letters is the worse half
+        let size = 20.0;
+        let b = baseline_in(0.0, 10.0, size);
+        assert!((b - size * font::ASCENT).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_heading_takes_whole_rows_however_large_its_type() {
+        let theme = Theme::DARK;
+        let row = theme.row();
+        for scale in theme.heading_scale {
+            let box_h = theme.rows_for(theme.base_size * scale);
+            let n = box_h / row;
+            assert!((n - n.round()).abs() < 1e-4, "scale {scale} gave {n} rows");
+            assert!(n >= scale - 1e-3, "scale {scale} must fit in {n} rows");
+        }
     }
 
     #[test]

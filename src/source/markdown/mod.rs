@@ -129,7 +129,12 @@ fn theme_for(cell: CellSize) -> layout::Theme {
     // a monospace glyph advances by size * ADVANCE_RATIO, and a
     // cell is exactly one advance wide, so this sets the body
     // text to the width of the terminal's own characters
-    let size = (cell.w as f32 / font::ADVANCE_RATIO).clamp(MIN_SIZE, MAX_SIZE);
+    // capped at the cell height as well as derived from its
+    // width: a line box is cell.h only while the type fits in
+    // one row, and the viewer addresses lines by row
+    let size = (cell.w as f32 / font::ADVANCE_RATIO)
+        .min(cell.h as f32)
+        .clamp(MIN_SIZE, MAX_SIZE);
 
     layout::Theme {
         base_size: size,
@@ -196,6 +201,20 @@ mod tests {
 
         assert_eq!(ix.outline.len(), 1);
         assert!(ix.outline[0].y < y, "the heading is above the match");
+    }
+
+    #[test]
+    fn a_body_line_is_exactly_one_terminal_row() {
+        // the viewer writes over the page in cells, which only
+        // lines up while a line box is the cell it sits on
+        for (w, h) in [(7, 14), (9, 18), (10, 20), (14, 32), (8, 30), (20, 20)] {
+            let theme = theme_for(CellSize { w, h });
+            assert!(
+                (theme.row() - h as f32).abs() < 0.01,
+                "a {w}x{h} cell gave a row of {}",
+                theme.row()
+            );
+        }
     }
 
     #[test]
