@@ -116,9 +116,10 @@ And the path rules have to be settled: files beside the document, no `..`
 climbing out, no network, and a cap on decoded size.
 
 The whole document is rasterized once, into memory, and the viewer transmits
-that page to the terminal a single time. Scrolling then sends a new source
-rectangle for the image the terminal already holds, which costs 69 bytes.
-Thirty scrolls send no transmits at all and about 4.7KB.
+it to the terminal a single time, in bands it never cuts again. Scrolling then
+sends a new source rectangle for the pixels the terminal already holds, which
+costs 69 bytes, or twice that for a window lying over a seam. Thirty scrolls
+send no transmits at all and about 4.7KB.
 
 Do not go back to drawing a screenful at a time. It was tried, and cutting a
 new image whenever the view left the last one is what made scrolling drag: each
@@ -222,34 +223,38 @@ escape key and quitting on the first arrow press.
 
 ## Multiplexers
 
-The viewer draws correctly in raw Ghostty and shows a blank screen under herdr
-and under tmux. `--print` works everywhere. Whatever is wrong is in the
-interactive path and only under a multiplexer, and it is unresolved.
+A document drew as a blank page under herdr while a picture in the same viewer
+drew fine and `--print` worked everywhere. The cause was size, and the
+mechanism is worth keeping because nothing anywhere reports it.
 
-Do not trust what a multiplexer says about itself. herdr answers `a=q` for the
-file transport (`t=f`) with `OK`, and then refuses every real transmission with
-`EINVAL: unsupported medium`. A query is not evidence of anything; only a real
-transmission is. An afternoon went into a feature built on that `OK`.
+herdr estimates an image's base64-encoded size and drops any asset over
+`MAX_GRAPHICS_FRAME_SIZE - MAX_FRAME_SIZE`, which is 32 MiB less 2 MiB. The sum
+runs on decoded RGBA, so compressing better does not help: a page of 169 KiB on
+the wire is dropped exactly as one of 1.4 MB when both decode to the same
+pixels. The drop is a bare `continue` in `kitty_graphics/surface.rs` with no
+error reply and no line in `herdr-server.log`, and the placement survives it,
+so the pane reserves the space and paints nothing. At 1267 pixels across, the
+ceiling works out at 4637 rows; measured, 4576 drew and 4800 did not.
 
-It also fails silently. Storing an oversized image produces no error, and the
-refusal surfaces only as `ENOENT: image not found` when the placement arrives.
-So a design that shrinks an image when the terminal complains cannot work here,
-because nothing complains.
+So the viewer sends a page in bands of `BAND_PIXELS`, each transmitted once
+under an id of its own, the way `--print` already cut its pieces. A band is cut
+on whole terminal rows, so the page stays on the row grid across a seam, and a
+window lying over one places both sides of it for a second placement and no
+pixels. This is not the screenful-at-a-time design that made scrolling drag:
+bands are cut once when the page loads, never again as it scrolls.
 
-Measured under herdr on the normal screen, at 1904 pixels wide: images up to
-10000 pixel rows store and place, 11000 does not. The viewer's page is 8403
-rows, which is under that, so the page being too large is **not** the
-explanation. What has not been tested is the alternate screen, which the viewer
-uses and the ladder does not. In its favour: the builds that sent 5 megapixels
-drew and the ones that sent 16 did not, and neither figure matches the 19 the
-ladder accepts outside the alternate screen. The next test is that same ladder
-wrapped in `\x1b[?1049h`.
+A band is capped at 10000 pixels a side as well. That is kitty's
+`max_dimension`, inherited by Ghostty and by the Ghostty core herdr is built
+on, and a narrow page can sit under the byte budget and still run past it.
 
-herdr's kitty graphics support is deliberate, and is said to be better as of
-0.9, which is the version everything above was measured against. Nothing here
-explains how that squares with the refusals, so the next thing to read is
-herdr's own implementation: which transport it actually wants is a question
-its source should answer, and answering it beats another round of probing.
+Do not trust what a multiplexer says about itself. herdr answers a kitty
+file-transfer query with `OK` deliberately, so that applications detect the
+capability, while refusing the transfer that follows. gat sent `t=f` once and
+built a feature on that `OK`; the transport has since gone and the direct
+medium was never the problem. A query is not evidence of anything; only a
+transmission is.
+
+tmux was blank too and has not been retried since any of this.
 
 `gat --probe` carries the ladder. It stores and places an image at a range of
 heights the way the viewer does and prints what came back, reading the replies

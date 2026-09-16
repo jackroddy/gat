@@ -37,6 +37,22 @@ const MAX_ZOOM: f64 = 32.0;
 const MIN_ZOOM: f64 = 1.0;
 const PAN_STEP: f64 = 0.2;
 
+/// How much of a page goes into one transmitted image.
+//
+// herdr drops an image whose base64-estimated size passes 30
+// MiB, which is 23.5MB of pixels, with no error reply and
+// nothing in its log. kitty, ghostty and herdr all refuse a
+// side over 10000px as well. four megapixels is 16MB of RGBA
+// and about 3000 rows, which clears both with room to spare
+const BAND_PIXELS: u32 = 4_000_000;
+
+/// The longest side a terminal will store.
+//
+// kitty's own limit, inherited by ghostty and by the ghostty
+// core herdr is built on: `max_dimension = 10000`. a narrow
+// page can sit under BAND_PIXELS and still pass it
+const MAX_SIDE: u32 = 10_000;
+
 /// The colour the hit you are on is underlined in.
 //
 // pink because it has to be findable at a glance and must
@@ -83,17 +99,33 @@ impl Drop for Screen {
     }
 }
 
+/// One piece of the page, transmitted under an id of its own.
+struct Band {
+    /// The top of this band, in page pixels.
+    y: u32,
+    h: u32,
+
+    /// The id the terminal holds it under.
+    id: u32,
+
+    /// Its pixels, until they have been sent.
+    payload: Option<kitty::Encoded>,
+}
+
 struct Shown {
-    /// The whole rasterized page, or the whole image.
+    /// The size of the whole page, in pixels.
+    w: u32,
+    h: u32,
+
+    /// The page in bands, top to bottom.
     //
-    // the terminal holds all of it, so scrolling is a source
+    // the terminal holds all of them, so scrolling is a source
     // rectangle it already has the pixels for. Handing it a
     // screenful at a time instead made it load an image per
-    // keypress, which is what made scrolling drag
-    image: Framebuffer,
-
-    /// The id the terminal holds `image` under.
-    id: u32,
+    // keypress, which is what made scrolling drag. the bands
+    // exist because a terminal will refuse one image this
+    // large, not so that they can be cut again
+    bands: Vec<Band>,
 
     kind: source::Kind,
 
@@ -116,8 +148,8 @@ impl View {
     fn reset(shown: &Shown, cells: (u32, u32), cell: CellSize) -> View {
         let mut view = View {
             zoom: 1.0,
-            cx: shown.image.width() as f64 / 2.0,
-            cy: shown.image.height() as f64 / 2.0,
+            cx: f64::from(shown.w) / 2.0,
+            cy: f64::from(shown.h) / 2.0,
         };
 
         // centred, a long document would open in its middle
@@ -224,9 +256,18 @@ fn event_loop(
                     match result {
                         Ok(mut fresh) => {
                             view = View::reset(&fresh, cells, cell);
-                            fresh.id = kitty::next_id();
-                            let encoded = kitty::encode(&fresh.image)?;
-                            kitty::emit(out, &encoded, fresh.id, false, kitty::Quiet::ErrorsOnly)?;
+                            for band in &mut fresh.bands {
+                                let Some(payload) = band.payload.take() else {
+                                    continue;
+                                };
+                                kitty::emit(
+                                    out,
+                                    &payload,
+                                    band.id,
+                                    false,
+                                    kitty::Quiet::ErrorsOnly,
+                                )?;
+                            }
 
                             // place the new image before dropping the old one,
                             // so the screen never shows the gap between them
@@ -238,7 +279,7 @@ fn event_loop(
                                 &hits, hit,
                             )?;
                             if let Some(old) = previous {
-                                kitty::forget(out, old.id)?;
+                                forget_all(out, &old)?;
                             }
                             out.flush()?;
                             dirty = false;
@@ -246,7 +287,7 @@ fn event_loop(
                         Err(e) => {
                             failure = Some(e);
                             if let Some(old) = shown.take() {
-                                kitty::forget(out, old.id)?;
+                                forget_all(out, &old)?;
                             }
                             dirty = true;
                         }
@@ -335,6 +376,7 @@ fn event_loop(
                         Some(ix) => ix.find(&query),
                         None => Vec::new(),
                     };
+
                     hit = 0;
                     note = Some(step(&mut view, &shown, &hits, hit, &query, cells, cell));
                 }
@@ -614,6 +656,64 @@ fn snap(view: &mut View, s: &Shown, cells: (u32, u32), cell: CellSize) {
         .clamp(g.src_h / 2.0, (g.doc_h - g.src_h / 2.0).max(g.src_h / 2.0));
 }
 
+/// Drop every band of `s` from the terminal's memory.
+fn forget_all(out: &mut impl Write, s: &Shown) -> std::io::Result<()> {
+    for band in &s.bands {
+        kitty::forget(out, band.id)?;
+    }
+    Ok(())
+}
+
+/// One band, and the row of the screen its top edge lands on.
+struct Placed {
+    id: u32,
+    row: u32,
+    p: Placement,
+}
+
+/// The bands the window can see, top to bottom.
+fn placed(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Vec<Placed> {
+    // one band is the whole picture, and a picture is fitted
+    // rather than drawn 1:1, so it keeps the original sums
+    if s.bands.len() == 1 {
+        return vec![Placed {
+            id: s.bands[0].id,
+            row: 0,
+            p: placement(s, view, cells, cell),
+        }];
+    }
+
+    // more than one band means a document, which is drawn 1:1
+    // and scrolled in whole rows, so every division here is exact
+    let g = geom(s, view, cells, cell);
+    let whole = placement(s, view, cells, cell);
+    let (top, bottom) = (g.doc_top, g.doc_top + g.src_h);
+
+    let mut out = Vec::new();
+    for band in &s.bands {
+        let from = f64::from(band.y).max(top);
+        let to = f64::from(band.y + band.h).min(bottom);
+        if to <= from {
+            continue;
+        }
+        let rows = ((to - from) / f64::from(cell.h)).round() as u32;
+        if rows == 0 {
+            continue;
+        }
+        out.push(Placed {
+            id: band.id,
+            row: ((from - top) / f64::from(cell.h)).round() as u32,
+            p: Placement {
+                src_y: (from - f64::from(band.y)) as u32,
+                src_h: (to - from) as u32,
+                rows,
+                ..whole
+            },
+        });
+    }
+    out
+}
+
 /// Decode the source rectangle and destination cell box for the current view.
 fn placement(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Placement {
     let g = geom(s, view, cells, cell);
@@ -653,8 +753,8 @@ struct Geom {
 }
 
 fn geom(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Geom {
-    let img_w = s.image.width().max(1) as f64;
-    let doc_h = s.image.height().max(1) as f64;
+    let img_w = f64::from(s.w.max(1));
+    let doc_h = f64::from(s.h.max(1));
     let (cols, rows) = (cells.0.max(1), cells.1.saturating_sub(1).max(1));
     let view_w = (cols * cell.w) as f64;
     let view_h = (rows * cell.h) as f64;
@@ -706,7 +806,13 @@ fn draw(
     out.write_all(b"\x1b[H\x1b[J")?;
 
     if let Some(s) = shown {
-        kitty::place(out, s.id, &placement(s, view, cells, cell))?;
+        for band in placed(s, view, cells, cell) {
+            // each band is placed where the cursor is, and the
+            // protocol's C=1 leaves the cursor alone, so the
+            // caller says where every one of them goes
+            write!(out, "\x1b[{};1H", band.row + 1)?;
+            kitty::place(out, band.id, &band.p)?;
+        }
         mark(out, s, view, cells, cell, hits, at)?;
     }
 
@@ -785,12 +891,59 @@ fn load(
     if let Some(ix) = index.as_mut() {
         ix.scale(scale as f32);
     }
+    let (w, h) = (fb.width(), fb.height());
     Ok(Shown {
-        image: fb,
-        id: 0,
+        w,
+        h,
+        bands: split(fb, band_height(w, cell.h))?,
         kind,
         index,
     })
+}
+
+/// How tall one band may be, for a page `w` pixels across.
+fn band_height(w: u32, cell_h: u32) -> u32 {
+    // whole rows, so a band begins where a terminal row does
+    // and the page stays on the grid across a seam
+    let cell_h = cell_h.max(1);
+    let tall = (BAND_PIXELS / w.max(1)).clamp(1, MAX_SIDE);
+    (tall / cell_h).max(1) * cell_h
+}
+
+/// Cut `fb` into bands small enough for a terminal to accept, and compress
+/// each one.
+//
+// on the worker thread with the decode, because a long page
+// is several megabytes of zlib and doing it on the main
+// thread would freeze the spinner over exactly the wait it
+// exists to cover
+fn split(fb: Framebuffer, band_h: u32) -> Result<Vec<Band>, Box<dyn std::error::Error>> {
+    let (w, h) = (fb.width().max(1), fb.height().max(1));
+    let band_h = band_h.max(1);
+
+    if h <= band_h {
+        return Ok(vec![Band {
+            y: 0,
+            h,
+            id: kitty::next_id(),
+            payload: Some(kitty::encode(&fb)?),
+        }]);
+    }
+
+    let mut bands = Vec::new();
+    let mut y = 0;
+    while y < h {
+        let tall = band_h.min(h - y);
+        let piece = image::imageops::crop_imm(&fb, 0, y, w, tall).to_image();
+        bands.push(Band {
+            y,
+            h: tall,
+            id: kitty::next_id(),
+            payload: Some(kitty::encode(&piece)?),
+        });
+        y += tall;
+    }
+    Ok(bands)
 }
 
 /// Rasterize `path` on a worker thread.
@@ -1075,6 +1228,99 @@ mod tests {
     }
 
     #[test]
+    fn a_band_fits_what_a_terminal_will_take() {
+        // herdr drops an image whose base64-estimated size
+        // passes 30 MiB with no error and nothing in its log,
+        // so this is herdr's own sum, run against our bands
+        const BUDGET: u64 = 30 * 1024 * 1024;
+
+        for w in [300, 400, 1267, 1920, 3840, 8000] {
+            for cell_h in [16, 20, 32, 48] {
+                let h = band_height(w, cell_h);
+                let rgba = u64::from(w) * u64::from(h) * 4;
+                let wire = rgba.div_ceil(3) * 4 + rgba.div_ceil(3072) * 16 + 1024;
+
+                assert!(wire <= BUDGET, "{w}x{h} estimates {wire} bytes");
+                assert!(h <= MAX_SIDE, "{w}x{h} is taller than a terminal stores");
+                assert_eq!(h % cell_h, 0, "{w}x{h} is not a whole number of rows");
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_is_cut_into_bands_that_cover_it_exactly() {
+        let bands = split(image(40, 100), 30).unwrap();
+        assert_eq!(bands.len(), 4);
+
+        assert_eq!(
+            bands.iter().map(|b| (b.y, b.h)).collect::<Vec<_>>(),
+            vec![(0, 30), (30, 30), (60, 30), (90, 10)],
+            "contiguous, and the last one is the remainder"
+        );
+        assert!(
+            bands.iter().all(|b| b.payload.is_some()),
+            "every band carries its pixels until they are sent"
+        );
+
+        let ids: std::collections::HashSet<u32> = bands.iter().map(|b| b.id).collect();
+        assert_eq!(ids.len(), 4, "each band needs an id of its own");
+    }
+
+    #[test]
+    fn a_short_page_is_one_band() {
+        let bands = split(image(40, 20), 30).unwrap();
+        assert_eq!(bands.len(), 1);
+        assert_eq!((bands[0].y, bands[0].h), (0, 20));
+    }
+
+    #[test]
+    fn a_window_over_a_seam_places_both_bands() {
+        // 400x4000 in bands of 1000, with the window on
+        // 900..1380: the last 100px of one band and the first
+        // 380 of the next
+        let s = banded(400, 4000, 1000);
+        let view = view(1.0, 200.0, 1140.0);
+        let bands = placed(&s, &view, (80, 25), CELL);
+
+        assert_eq!(bands.len(), 2, "a seam needs both sides of it");
+
+        assert_eq!(bands[0].id, 100);
+        assert_eq!(bands[0].row, 0);
+        assert_eq!(bands[0].p.src_y, 900);
+        assert_eq!(bands[0].p.src_h, 100);
+        assert_eq!(bands[0].p.rows, 5);
+
+        assert_eq!(bands[1].id, 101);
+        assert_eq!(bands[1].row, 5, "the second starts where the first ends");
+        assert_eq!(bands[1].p.src_y, 0);
+        assert_eq!(bands[1].p.src_h, 380);
+        assert_eq!(bands[1].p.rows, 19);
+
+        // and together they fill the window exactly
+        let rows: u32 = bands.iter().map(|b| b.p.rows).sum();
+        assert_eq!(rows, 24, "24 rows of viewport");
+    }
+
+    #[test]
+    fn a_window_inside_one_band_places_only_that_band() {
+        let s = banded(400, 4000, 1000);
+        let view = view(1.0, 200.0, 1500.0);
+        let bands = placed(&s, &view, (80, 25), CELL);
+        assert_eq!(bands.len(), 1);
+        assert_eq!(bands[0].id, 101, "the second band");
+        assert_eq!(bands[0].row, 0);
+    }
+
+    #[test]
+    fn a_picture_is_still_placed_whole() {
+        let s = shown(image(400, 300), source::Kind::Image);
+        let view = View::reset(&s, (80, 25), CELL);
+        let bands = placed(&s, &view, (80, 25), CELL);
+        assert_eq!(bands.len(), 1);
+        assert_eq!(bands[0].row, 0);
+    }
+
+    #[test]
     fn a_document_window_snaps_to_a_row_boundary() {
         let s = document(20.0);
         let mut v = View::reset(&s, (80, 25), CELL);
@@ -1302,12 +1548,33 @@ mod tests {
     }
 
     fn shown(image: Framebuffer, kind: source::Kind) -> Shown {
+        let (w, h) = (image.width(), image.height());
         Shown {
-            image,
-            id: 1,
+            w,
+            h,
+            bands: vec![Band {
+                y: 0,
+                h,
+                id: 1,
+                payload: None,
+            }],
             kind,
             index: None,
         }
+    }
+
+    /// The same page cut into bands `tall` pixels each, as a long one is.
+    fn banded(w: u32, h: u32, tall: u32) -> Shown {
+        let mut s = shown(image(w, h), source::Kind::Document);
+        s.bands = (0..h.div_ceil(tall))
+            .map(|i| Band {
+                y: i * tall,
+                h: tall.min(h - i * tall),
+                id: 100 + i,
+                payload: None,
+            })
+            .collect();
+        s
     }
 
     #[test]
