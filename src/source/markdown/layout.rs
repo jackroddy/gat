@@ -6,6 +6,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::font;
 use super::highlight::{self, Span};
 use super::parse::{Align, Block, Callout, Cell, Doc, Footnote, Inline, ListItem, Style, Table};
+use crate::source::{Heading, Line};
 
 /// A colour, as red, green, blue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +18,10 @@ pub struct Page {
     pub w: f32,
     pub h: f32,
     pub items: Vec<Item>,
+
+    /// The text of the page, one entry per drawn line.
+    pub lines: Vec<Line>,
+    pub outline: Vec<Heading>,
 }
 
 #[derive(Debug)]
@@ -110,6 +115,7 @@ pub fn layout(doc: &Doc, theme: &Theme, width: f32) -> Page {
         theme,
         y: theme.margin,
         items: Vec::new(),
+        outline: Vec::new(),
     };
     let content_w = (width - 2.0 * theme.margin).max(1.0);
     c.blocks(&doc.blocks, theme.margin, content_w);
@@ -117,14 +123,58 @@ pub fn layout(doc: &Doc, theme: &Theme, width: f32) -> Page {
     Page {
         w: width,
         h: c.y + theme.margin,
+        lines: lines_of(&c.items),
+        outline: c.outline,
         items: c.items,
     }
+}
+
+/// Recover the page's text from what was drawn, one entry per line.
+fn lines_of(items: &[Item]) -> Vec<Line> {
+    let mut runs: Vec<(f32, f32, f32, &str)> = items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Run {
+                x,
+                baseline,
+                size,
+                text,
+                ..
+            } => Some((*baseline, *x, *size, text.as_str())),
+            Item::Rect { .. } => None,
+        })
+        .collect();
+    runs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+
+    let mut out: Vec<Line> = Vec::new();
+    let mut end = 0.0f32;
+    for (baseline, x, size, text) in runs {
+        let advance = size * font::ADVANCE_RATIO;
+        let top = baseline - size * font::ASCENT;
+        match out.last_mut() {
+            Some(l) if (l.y - top).abs() < 0.5 => {
+                // a gap on the page is a gap in the text, so
+                // a table's columns do not run together
+                if x > end + advance / 2.0 {
+                    l.text.push(' ');
+                }
+                l.text.push_str(text);
+            }
+            _ => out.push(Line {
+                y: top,
+                text: text.to_owned(),
+            }),
+        }
+        end = x + text.width() as f32 * advance;
+    }
+    out
 }
 
 struct Cursor<'a> {
     theme: &'a Theme,
     y: f32,
     items: Vec<Item>,
+    outline: Vec<Heading>,
 }
 
 impl Cursor<'_> {
@@ -154,6 +204,11 @@ impl Cursor<'_> {
                     bold: true,
                     ..Style::default()
                 };
+                self.outline.push(Heading {
+                    level: *level,
+                    text: flatten(inlines),
+                    y: self.y,
+                });
                 self.flow(inlines, x, w, size, style);
             }
             Block::Paragraph(inlines) => {
@@ -489,6 +544,20 @@ fn fold(spans: Vec<Span>, cols: usize) -> Vec<Vec<(usize, Span)>> {
     out
 }
 
+/// The plain text of some inlines, for the outline.
+fn flatten(inlines: &[Inline]) -> String {
+    let mut out = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text { text, .. } => out.push_str(text),
+            Inline::Image { alt } => out.push_str(alt),
+            Inline::Note { number } => out.push_str(&format!("[{number}]")),
+            Inline::Break => out.push(' '),
+        }
+    }
+    out
+}
+
 /// Blank characters between one table column and the next.
 const TABLE_GAP: usize = 2;
 
@@ -742,6 +811,47 @@ mod tests {
             text: text.into(),
             style: Style::default(),
         }]
+    }
+
+    fn page_of(md: &str) -> Page {
+        layout(&super::super::parse::parse(md), &Theme::DARK, 600.0)
+    }
+
+    #[test]
+    fn the_index_recovers_the_page_line_by_line() {
+        let page = page_of("# Title\n\nsome words here\n");
+        let text: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(text, vec!["Title", "some words here"]);
+
+        // the lines come back in the order they are drawn
+        assert!(page.lines[0].y < page.lines[1].y);
+    }
+
+    #[test]
+    fn the_outline_holds_every_heading_with_its_level() {
+        let page = page_of("# One\n\ntext\n\n### Three\n");
+        let seen: Vec<(u8, &str)> = page
+            .outline
+            .iter()
+            .map(|h| (h.level, h.text.as_str()))
+            .collect();
+        assert_eq!(seen, vec![(1, "One"), (3, "Three")]);
+    }
+
+    #[test]
+    fn a_tables_columns_do_not_run_together_in_the_index() {
+        // the cells are drawn apart, so the text they yield
+        // has to be separated or a search spans the gap
+        let page = page_of("| ab | cd |\n|----|----|\n| ef | gh |\n");
+        let text: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(text, vec!["ab cd", "ef gh"]);
+    }
+
+    #[test]
+    fn a_wrapped_paragraph_yields_one_index_line_per_drawn_line() {
+        let page = page_of(&"word ".repeat(200));
+        assert!(page.lines.len() > 1);
+        assert!(page.lines.iter().all(|l| l.text.starts_with("word")));
     }
 
     #[test]

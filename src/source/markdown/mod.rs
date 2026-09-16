@@ -13,7 +13,7 @@ use resvg::usvg;
 
 use crate::framebuffer::Framebuffer;
 use crate::geometry::CellSize;
-use crate::source::{Error, Hints, Loaded, svg};
+use crate::source::{Error, Hints, Index, Loaded, svg};
 
 /// The column count a page is laid out to, whatever pixel width
 /// the caller asks for.
@@ -110,10 +110,15 @@ fn draw(page: &layout::Page, bg: layout::Rgb, from_y: f32, h: f32) -> Result<Fra
 }
 
 pub fn load(bytes: &[u8], hints: Hints) -> Result<Loaded, Error> {
-    let (page, _, width) = lay_out(bytes, hints);
+    let (mut page, _, width) = lay_out(bytes, hints);
     let total_h = drawn_height(page.h, width, hints);
+    let fb = draw(&page, layout::Theme::DARK.bg, 0.0, total_h)?;
     Ok(Loaded {
-        fb: draw(&page, layout::Theme::DARK.bg, 0.0, total_h)?,
+        fb,
+        index: Some(Index {
+            lines: std::mem::take(&mut page.lines),
+            outline: std::mem::take(&mut page.outline),
+        }),
     })
 }
 
@@ -170,6 +175,27 @@ mod tests {
             max_h: h,
             cell: CellSize { w: 14, h: 32 },
         }
+    }
+
+    #[test]
+    fn the_viewer_gets_an_index_that_finds_words_inside_the_page() {
+        // what the viewer searches is this index, so a hit
+        // has to land inside the pixels it will scroll to
+        let md = b"# Heading\n\nfirst line\n\nthe needle is here\n\nlast line\n";
+        let loaded = load(md, hints(800, u32::MAX)).expect("should render");
+        let ix = loaded.index.expect("a document carries an index");
+
+        let hits = ix.find("NEEDLE");
+        assert_eq!(hits.len(), 1, "lines were {:?}", ix.lines);
+        let y = ix.lines[hits[0]].y;
+        assert!(
+            y > 0.0 && y < loaded.fb.height() as f32,
+            "hit at {y} is outside a page {} tall",
+            loaded.fb.height()
+        );
+
+        assert_eq!(ix.outline.len(), 1);
+        assert!(ix.outline[0].y < y, "the heading is above the match");
     }
 
     #[test]

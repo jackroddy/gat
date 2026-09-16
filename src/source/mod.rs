@@ -29,6 +29,66 @@ pub struct Hints {
 /// A decoded source.
 pub struct Loaded {
     pub fb: Framebuffer,
+
+    /// Where the words landed, for a document the viewer can search.
+    //
+    // a rasterized page is pixels, so nothing in it can be
+    // found by looking at it again. this is the same text
+    // layout already positioned, kept instead of discarded
+    pub index: Option<Index>,
+}
+
+#[derive(Debug, Default)]
+pub struct Index {
+    /// One entry per drawn line, top to bottom.
+    pub lines: Vec<Line>,
+    pub outline: Vec<Heading>,
+}
+
+#[derive(Debug)]
+pub struct Line {
+    /// The top of the line, in framebuffer pixels.
+    pub y: f32,
+    pub text: String,
+}
+
+#[derive(Debug)]
+pub struct Heading {
+    pub level: u8,
+    pub text: String,
+
+    /// The top of the heading, in framebuffer pixels.
+    pub y: f32,
+}
+
+impl Index {
+    /// Multiply every position by `k`, for a page the viewer resized.
+    pub fn scale(&mut self, k: f32) {
+        for l in &mut self.lines {
+            l.y *= k;
+        }
+        for h in &mut self.outline {
+            h.y *= k;
+        }
+    }
+
+    /// The top of every line holding `needle`, in order down the page.
+    //
+    // ascii case folding only: it is the one mapping that
+    // cannot change a string's length, and anything else
+    // would need the match's byte offset translated back
+    pub fn find(&self, needle: &str) -> Vec<usize> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let needle = needle.to_ascii_lowercase();
+        self.lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.text.to_ascii_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
 
 /// A source as one or more images, stacked top to bottom.
@@ -183,9 +243,56 @@ const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd"];
 
 /// A `Loaded` for a source that was decoded in full.
 fn whole(fb: Framebuffer) -> Loaded {
-    Loaded { fb }
+    Loaded { fb, index: None }
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index(lines: &[(f32, &str)]) -> Index {
+        Index {
+            lines: lines
+                .iter()
+                .map(|(y, text)| Line {
+                    y: *y,
+                    text: (*text).into(),
+                })
+                .collect(),
+            outline: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_search_ignores_ascii_case_and_answers_in_page_order() {
+        let ix = index(&[(0.0, "The Quick Fox"), (10.0, "a quick brown"), (20.0, "slow")]);
+        assert_eq!(ix.find("quick"), vec![0, 1]);
+        assert_eq!(ix.find("QUICK"), vec![0, 1]);
+        assert_eq!(ix.find("slow"), vec![2]);
+    }
+
+    #[test]
+    fn a_search_for_nothing_matches_nothing() {
+        let ix = index(&[(0.0, "text")]);
+        assert!(ix.find("").is_empty());
+        assert!(ix.find("absent").is_empty());
+    }
+
+    #[test]
+    fn scaling_moves_every_position_by_the_same_factor() {
+        let mut ix = index(&[(10.0, "a"), (20.0, "b")]);
+        ix.outline.push(Heading {
+            level: 1,
+            text: "h".into(),
+            y: 40.0,
+        });
+        ix.scale(0.5);
+        assert_eq!(ix.lines[0].y, 5.0);
+        assert_eq!(ix.lines[1].y, 10.0);
+        assert_eq!(ix.outline[0].y, 20.0);
+    }
 }

@@ -86,6 +86,9 @@ struct Shown {
     id: u32,
 
     kind: source::Kind,
+
+    /// Where the words are, for a document; `None` for a picture.
+    index: Option<source::Index>,
 }
 
 /// Which part of the image the viewer is looking at.
@@ -144,6 +147,13 @@ enum Key {
     Reset,
     Next,
     Prev,
+    Search,
+
+    /// Step to another search hit, forwards for 1 and back for -1.
+    Hit(i32),
+
+    /// Step to another heading, forwards for 1 and back for -1.
+    Heading(i32),
 }
 
 fn event_loop(
@@ -169,6 +179,17 @@ fn event_loop(
         cy: 0.0,
     };
     let mut load_wanted = true;
+
+    // what the status line says instead of the help text
+    let mut note: Option<String> = None;
+
+    // Some while a search is being typed, holding it so far
+    let mut typing: Option<Vec<u8>> = None;
+    let mut query = String::new();
+
+    // lines holding the current query, as indices into the page's own
+    let mut hits: Vec<usize> = Vec::new();
+    let mut hit = 0usize;
 
     // shrunk on refusal, never below one viewport
 
@@ -200,7 +221,9 @@ fn event_loop(
                             // place the new image before dropping the old one,
                             // so the screen never shows the gap between them
                             let previous = shown.replace(fresh);
-                            draw(out, &shown, &view, cells, cell, files, index, &failure)?;
+                            hits.clear();
+                            note = None;
+                            draw(out, &shown, &view, cells, cell, files, index, &failure, None)?;
                             if let Some(old) = previous {
                                 kitty::forget(out, old.id)?;
                             }
@@ -226,7 +249,21 @@ fn event_loop(
         }
 
         if dirty {
-            draw(out, &shown, &view, cells, cell, files, index, &failure)?;
+            let status = match &typing {
+                Some(buf) => Some(format!("/{}", String::from_utf8_lossy(buf))),
+                None => note.clone(),
+            };
+            draw(
+                out,
+                &shown,
+                &view,
+                cells,
+                cell,
+                files,
+                index,
+                &failure,
+                status.as_deref(),
+            )?;
             out.flush()?;
             dirty = false;
         }
@@ -257,7 +294,34 @@ fn event_loop(
             dirty = true;
         }
 
-        for key in keys_from(&input) {
+        // a burst can hold a whole keystroke past the one
+        // that ends the search, so the query takes only the
+        // bytes up to it and the rest go on as keys
+        let mut rest: &[u8] = &input;
+        if let Some(buf) = typing.as_mut() {
+            let (outcome, taken) = type_into(buf, &input);
+            rest = &input[taken..];
+            match outcome {
+                Typed::More => {}
+                Typed::Cancelled => {
+                    typing = None;
+                    note = None;
+                }
+                Typed::Done => {
+                    let typed = typing.take().unwrap_or_default();
+                    query = String::from_utf8_lossy(&typed).into_owned();
+                    hits = match shown.as_ref().and_then(|s| s.index.as_ref()) {
+                        Some(ix) => ix.find(&query),
+                        None => Vec::new(),
+                    };
+                    hit = 0;
+                    note = Some(step(&mut view, &shown, &hits, hit, &query, cells, cell));
+                }
+            }
+            dirty = true;
+        }
+
+        for key in keys_from(rest) {
             match key {
                 Key::Quit => return Ok(()),
                 Key::Next if index + 1 < files.len() => {
@@ -273,10 +337,27 @@ fn event_loop(
                     if let Some(s) = &shown {
                         view = View::reset(s, cells, cell);
                     }
+                    note = None;
                     dirty = true;
                 }
                 Key::Zoom(factor) => {
                     view.zoom = (view.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+                    dirty = true;
+                }
+                Key::Search => {
+                    typing = Some(Vec::new());
+                    dirty = true;
+                }
+                Key::Hit(dir) => {
+                    if !hits.is_empty() {
+                        let n = hits.len();
+                        hit = (hit + if dir > 0 { 1 } else { n - 1 }) % n;
+                    }
+                    note = Some(step(&mut view, &shown, &hits, hit, &query, cells, cell));
+                    dirty = true;
+                }
+                Key::Heading(dir) => {
+                    note = Some(heading(&mut view, &shown, dir, cells, cell));
                     dirty = true;
                 }
                 Key::Pan(dx, dy) => {
@@ -295,6 +376,104 @@ fn event_loop(
             }
         }
     }
+}
+
+/// What a burst of input did to a search being typed.
+enum Typed {
+    More,
+    Done,
+    Cancelled,
+}
+
+/// Feed `input` into the query in `buf`, stopping at the byte that ends the
+/// search. Answers what happened and how much of `input` it consumed.
+fn type_into(buf: &mut Vec<u8>, input: &[u8]) -> (Typed, usize) {
+    for (i, &b) in input.iter().enumerate() {
+        match b {
+            b'\r' | b'\n' => return (Typed::Done, i + 1),
+            0x1b | 0x03 => return (Typed::Cancelled, i + 1),
+            0x7f | 0x08 => {
+                // a whole character, not a byte: half of one
+                // left behind would show as a replacement and
+                // match nothing
+                while buf.pop().is_some_and(|b| (0x80..0xc0).contains(&b)) {}
+            }
+
+            // anything below space is a control key this does
+            // not handle; the rest may be part of a multi-byte
+            // character
+            b if b >= 0x20 => buf.push(b),
+            _ => {}
+        }
+    }
+    (Typed::More, input.len())
+}
+
+/// Move the view to hit `at`, and say what the status line should show.
+fn step(
+    view: &mut View,
+    shown: &Option<Shown>,
+    hits: &[usize],
+    at: usize,
+    query: &str,
+    cells: (u32, u32),
+    cell: CellSize,
+) -> String {
+    let Some(s) = shown else {
+        return format!("/{query}  nothing loaded");
+    };
+    let Some(ix) = &s.index else {
+        return format!("/{query}  not a document");
+    };
+    if hits.is_empty() {
+        return format!("/{query}  no matches");
+    }
+    let line = &ix.lines[hits[at]];
+    scroll_to(view, s, line.y, cells, cell);
+    format!("/{query}  {}/{}  {}", at + 1, hits.len(), line.text.trim())
+}
+
+/// Move the view to the next heading in `dir`, and say what to show.
+fn heading(
+    view: &mut View,
+    shown: &Option<Shown>,
+    dir: i32,
+    cells: (u32, u32),
+    cell: CellSize,
+) -> String {
+    let Some(s) = shown else {
+        return "nothing loaded".into();
+    };
+    let Some(ix) = &s.index else {
+        return "not a document".into();
+    };
+
+    // measured from the top of the viewport rather than its
+    // centre, so the heading already on screen is behind you
+    let top = view.cy - geom(s, view, cells, cell).src_h / 2.0;
+    let found = if dir > 0 {
+        ix.outline.iter().find(|h| f64::from(h.y) > top + 1.0)
+    } else {
+        ix.outline.iter().rev().find(|h| f64::from(h.y) < top - 1.0)
+    };
+    match found {
+        Some(h) => {
+            scroll_to(view, s, h.y, cells, cell);
+            format!("{} {}", "#".repeat(h.level as usize), h.text.trim())
+        }
+        None => "no more headings".into(),
+    }
+}
+
+/// Scroll so that page row `y` sits near the top of the viewport.
+fn scroll_to(view: &mut View, s: &Shown, y: f32, cells: (u32, u32), cell: CellSize) {
+    let g = geom(s, view, cells, cell);
+    let lo = g.src_h / 2.0;
+    let hi = (g.doc_h - g.src_h / 2.0).max(lo);
+
+    // a third down rather than centred, so what follows the
+    // line is what fills the screen
+    view.cy = (f64::from(y) + g.src_h / 6.0).clamp(lo, hi);
 }
 
 /// Decode the source rectangle and destination cell box for the current view.
@@ -374,6 +553,7 @@ fn draw(
     files: &[PathBuf],
     index: usize,
     failure: &Option<String>,
+    note: Option<&str>,
 ) -> std::io::Result<()> {
     // erase from the cursor down clears text but, per the protocol, must not
     // touch graphics; only a full CSI 2 J would drop the image as well
@@ -387,10 +567,11 @@ fn draw(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let status = match failure {
-        Some(e) => format!("{name}  {e}"),
-        None => format!(
-            "{name}  [{}/{}]  {:.0}%  hjkl/arrows pan  +/- zoom  0 reset  n/p file  q quit",
+    let status = match (failure, note) {
+        (Some(e), _) => format!("{name}  {e}"),
+        (None, Some(n)) => format!("{name}  {n}"),
+        (None, None) => format!(
+            "{name}  [{}/{}]  {:.0}%  hjkl pan  +- zoom  0 reset  / find  ][ hit  }}{{ head  np file  q quit",
             index + 1,
             files.len(),
             view.zoom * 100.0
@@ -424,7 +605,8 @@ fn load(
         },
         cell,
     };
-    let decoded = source::load(&bytes, path, hints)?.fb;
+    let loaded = source::load(&bytes, path, hints)?;
+    let (decoded, mut index) = (loaded.fb, loaded.index);
 
     // a document is exempt: its height is the document, and a
     // screenful of it would drop the text panning is for
@@ -445,10 +627,17 @@ fn load(
         decoded
     };
     framebuffer::flatten_onto(&mut fb, background);
+
+    // the index is in layout pixels, and the page may have
+    // been shrunk to fit since
+    if let Some(ix) = index.as_mut() {
+        ix.scale(scale as f32);
+    }
     Ok(Shown {
         image: fb,
         id: 0,
         kind,
+        index,
     })
 }
 
@@ -606,6 +795,11 @@ fn decode_keys(buf: &[u8]) -> (Vec<Key>, usize) {
             b'0' => keys.push(Key::Reset),
             b'n' | b' ' => keys.push(Key::Next),
             b'p' => keys.push(Key::Prev),
+            b'/' => keys.push(Key::Search),
+            b']' => keys.push(Key::Hit(1)),
+            b'[' => keys.push(Key::Hit(-1)),
+            b'}' => keys.push(Key::Heading(1)),
+            b'{' => keys.push(Key::Heading(-1)),
             _ => {}
         }
         i += 1;
@@ -637,6 +831,49 @@ mod tests {
         status_line(&mut out, (80, 24), text).unwrap();
         let s = String::from_utf8(out).unwrap();
         s.strip_prefix("\x1b[24;1H\x1b[K").unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_search_takes_only_the_bytes_up_to_the_return() {
+        // read_burst hands over whatever arrived together, so
+        // a key pressed just after return rides along in the
+        // same input and must not join the query
+        let mut buf = Vec::new();
+        let (outcome, taken) = type_into(&mut buf, b"ab\rc");
+        assert!(matches!(outcome, Typed::Done));
+        assert_eq!(taken, 3);
+        assert_eq!(buf, b"ab");
+    }
+
+    #[test]
+    fn a_cancelled_search_also_leaves_the_rest_of_the_burst() {
+        let mut buf = Vec::new();
+        let (outcome, taken) = type_into(&mut buf, b"ab\x1bq");
+        assert!(matches!(outcome, Typed::Cancelled));
+        assert_eq!(taken, 3);
+    }
+
+    #[test]
+    fn a_search_accumulates_across_bursts() {
+        let mut buf = Vec::new();
+        let (outcome, taken) = type_into(&mut buf, b"ab");
+        assert!(matches!(outcome, Typed::More));
+        assert_eq!(taken, 2);
+        type_into(&mut buf, b"cd");
+        assert_eq!(buf, b"abcd");
+    }
+
+    #[test]
+    fn backspace_removes_a_whole_character_and_stops_at_empty() {
+        let mut buf = "aé".as_bytes().to_vec();
+        assert_eq!(buf.len(), 3, "é is two bytes");
+
+        type_into(&mut buf, b"\x7f");
+        assert_eq!(String::from_utf8(buf.clone()).unwrap(), "a");
+
+        // twice more than there is to delete
+        type_into(&mut buf, b"\x7f\x7f");
+        assert!(buf.is_empty());
     }
 
     #[test]
@@ -697,7 +934,12 @@ mod tests {
     }
 
     fn shown(image: Framebuffer, kind: source::Kind) -> Shown {
-        Shown { image, id: 1, kind }
+        Shown {
+            image,
+            id: 1,
+            kind,
+            index: None,
+        }
     }
 
     #[test]

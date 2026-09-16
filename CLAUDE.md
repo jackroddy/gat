@@ -130,6 +130,16 @@ sending a new source rectangle for the stored image, which the terminal scales.
 A frame costs 69 bytes. Re-encoding instead measured 40-90ms and several
 megabytes per frame, so think hard before moving redrawing back into Rust.
 
+Search scrolls, and does not highlight. The page is one image the terminal
+already holds, so drawing a box around a match means re-encoding and
+re-transmitting it, which is what the rest of the viewer is built to avoid. A
+hit moves the view and the status line carries the line it was found on, for
+the same 69 bytes a pan costs.
+
+What makes that possible is layout's own output, kept rather than recomputed.
+`lines_of` reads the text back out of the positioned runs in the display list,
+so there is no second copy of the page's words to keep in step with the first.
+
 Reuse one placement id and let the new placement replace the old one. Delete
 the old one first and the background shows through the gap, which reads as a
 flash on every keypress.
