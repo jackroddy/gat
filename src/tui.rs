@@ -283,6 +283,12 @@ fn event_loop(
             let now = term::current_cells();
             if now != cells {
                 cells = now;
+
+                // the window is a different number of rows, so
+                // the top of the view has moved off the grid
+                if let Some(s) = &shown {
+                    snap(&mut view, s, cells, cell);
+                }
                 dirty = true;
             }
             continue;
@@ -336,6 +342,7 @@ fn event_loop(
                 Key::Reset => {
                     if let Some(s) = &shown {
                         view = View::reset(s, cells, cell);
+                        snap(&mut view, s, cells, cell);
                     }
                     note = None;
                     dirty = true;
@@ -370,11 +377,23 @@ fn event_loop(
                         let g = geom(s, &view, cells, cell);
                         view.cx += dx * g.src_w;
 
+                        // a page scrolls by whole rows, so its lines
+                        // stay on the terminal's own grid and can be
+                        // written over; a picture has no rows
+                        let step = match row_of(s) {
+                            Some(row) => {
+                                let n = (dy.abs() * g.src_h / row).round().max(1.0);
+                                dy.signum() * n * row
+                            }
+                            None => dy * g.src_h,
+                        };
+
                         // clamped to the document, not the band, so a
                         // scroll past the rendered pixels requests the
                         // next band instead of stopping at a seam
-                        view.cy = (view.cy + dy * g.src_h)
+                        view.cy = (view.cy + step)
                             .clamp(g.src_h / 2.0, (g.doc_h - g.src_h / 2.0).max(g.src_h / 2.0));
+                        snap(&mut view, s, cells, cell);
                     }
                     dirty = true;
                 }
@@ -484,8 +503,33 @@ fn scroll_to(view: &mut View, s: &Shown, y: f32, cells: (u32, u32), cell: CellSi
     let hi = (g.doc_h - g.src_h / 2.0).max(lo);
 
     // a third down rather than centred, so what follows the
-    // line is what fills the screen
-    view.cy = (f64::from(y) + g.src_h / 6.0).clamp(lo, hi);
+    // line is what fills the screen. measured in whole rows,
+    // or the jump would take the page off the grid
+    let above = match row_of(s) {
+        Some(row) => (g.src_h / 6.0 / row).round() * row,
+        None => g.src_h / 6.0,
+    };
+    view.cy = (f64::from(y) + above).clamp(lo, hi);
+    snap(view, s, cells, cell);
+}
+
+/// The page's row height, for a document laid out on the row grid.
+fn row_of(s: &Shown) -> Option<f64> {
+    s.index
+        .as_ref()
+        .map(|i| f64::from(i.row))
+        .filter(|row| *row >= 1.0)
+}
+
+/// Move the view so the top of the window sits on a row boundary.
+fn snap(view: &mut View, s: &Shown, cells: (u32, u32), cell: CellSize) {
+    let Some(row) = row_of(s) else { return };
+    let g = geom(s, view, cells, cell);
+
+    let top = (view.cy - g.src_h / 2.0).max(0.0);
+    let snapped = (top / row).round() * row;
+    view.cy = (snapped + g.src_h / 2.0)
+        .clamp(g.src_h / 2.0, (g.doc_h - g.src_h / 2.0).max(g.src_h / 2.0));
 }
 
 /// Decode the source rectangle and destination cell box for the current view.
@@ -911,6 +955,67 @@ mod tests {
         .unwrap();
         let all = String::from_utf8_lossy(&out).into_owned();
         all.rsplit("\x1b[K").next().unwrap_or_default().to_owned()
+    }
+
+    /// A page 4000 pixels tall whose lines sit every `row` pixels.
+    fn document(row: f32) -> Shown {
+        let mut s = shown(image(400, 4000), source::Kind::Document);
+        s.index = Some(source::Index {
+            lines: (0..200)
+                .map(|i| source::Line {
+                    y: i as f32 * row,
+                    text: format!("line {i}"),
+                })
+                .collect(),
+            outline: Vec::new(),
+            row,
+        });
+        s
+    }
+
+    /// The top of the window, in page pixels.
+    fn top_of(s: &Shown, v: &View) -> f64 {
+        geom(s, v, (80, 25), CELL).doc_top
+    }
+
+    #[test]
+    fn a_document_window_snaps_to_a_row_boundary() {
+        let s = document(20.0);
+        let mut v = View::reset(&s, (80, 25), CELL);
+
+        for offset in [1.0, 9.0, 11.0, 19.0, 33.0, 197.0] {
+            v.cy = View::reset(&s, (80, 25), CELL).cy + offset;
+            snap(&mut v, &s, (80, 25), CELL);
+            let top = top_of(&s, &v);
+            assert!(
+                (top / 20.0 - (top / 20.0).round()).abs() < 1e-6,
+                "offset {offset} left the window top at {top}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_picture_is_left_where_it_was() {
+        // an image has no rows to snap to
+        let s = shown(image(400, 4000), source::Kind::Image);
+        let mut v = View::reset(&s, (80, 25), CELL);
+        let before = v.cy;
+        snap(&mut v, &s, (80, 25), CELL);
+        assert_eq!(v.cy, before);
+    }
+
+    #[test]
+    fn a_search_jump_lands_on_a_row_boundary() {
+        let s = document(20.0);
+        let mut v = View::reset(&s, (80, 25), CELL);
+        for y in [400.0, 1234.0, 2001.0, 3999.0] {
+            scroll_to(&mut v, &s, y, (80, 25), CELL);
+            let top = top_of(&s, &v);
+            assert!(
+                (top / 20.0 - (top / 20.0).round()).abs() < 1e-6,
+                "a jump to {y} left the window top at {top}"
+            );
+        }
     }
 
     #[test]

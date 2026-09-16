@@ -110,7 +110,7 @@ fn draw(page: &layout::Page, bg: layout::Rgb, from_y: f32, h: f32) -> Result<Fra
 }
 
 pub fn load(bytes: &[u8], hints: Hints) -> Result<Loaded, Error> {
-    let (mut page, _, width) = lay_out(bytes, hints);
+    let (mut page, theme, width) = lay_out(bytes, hints);
     let total_h = drawn_height(page.h, width, hints);
     let fb = draw(&page, layout::Theme::DARK.bg, 0.0, total_h)?;
     Ok(Loaded {
@@ -118,6 +118,7 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Loaded, Error> {
         index: Some(Index {
             lines: std::mem::take(&mut page.lines),
             outline: std::mem::take(&mut page.outline),
+            row: theme.row(),
         }),
     })
 }

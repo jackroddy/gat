@@ -43,6 +43,10 @@ pub struct Index {
     /// One entry per drawn line, top to bottom.
     pub lines: Vec<Line>,
     pub outline: Vec<Heading>,
+
+    /// The page's row height in pixels, which every line top is a
+    /// multiple of.
+    pub row: f32,
 }
 
 #[derive(Debug)]
@@ -70,6 +74,7 @@ impl Index {
         for h in &mut self.outline {
             h.y *= k;
         }
+        self.row *= k;
     }
 
     /// The top of every line holding `needle`, in order down the page.
@@ -264,6 +269,7 @@ mod tests {
                 })
                 .collect(),
             outline: Vec::new(),
+            row: 10.0,
         }
     }
 
