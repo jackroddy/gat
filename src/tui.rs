@@ -36,6 +36,16 @@ const ZOOM_HEADROOM: u32 = 2;
 const MAX_ZOOM: f64 = 32.0;
 const MIN_ZOOM: f64 = 1.0;
 const PAN_STEP: f64 = 0.2;
+
+/// The colour the hit you are on is underlined in.
+//
+// pink because it has to be findable at a glance and must
+// not read as a link, a callout or a code span, which are
+// blue, amber and salmon
+const MARK: (u8, u8, u8) = (0xff, 0x5f, 0xaf);
+
+/// The colour the other hits are underlined in.
+const MARK_DIM: (u8, u8, u8) = (0x8f, 0x3f, 0x6f);
 const ZOOM_IN: f64 = 1.25;
 const ZOOM_OUT: f64 = 0.8;
 
@@ -223,7 +233,10 @@ fn event_loop(
                             let previous = shown.replace(fresh);
                             hits.clear();
                             note = None;
-                            draw(out, &shown, &view, cells, cell, files, index, &failure, None)?;
+                            draw(
+                                out, &shown, &view, cells, cell, files, index, &failure, None,
+                                &hits, hit,
+                            )?;
                             if let Some(old) = previous {
                                 kitty::forget(out, old.id)?;
                             }
@@ -263,6 +276,8 @@ fn event_loop(
                 index,
                 &failure,
                 status.as_deref(),
+                &hits,
+                hit,
             )?;
             out.flush()?;
             dirty = false;
@@ -433,6 +448,73 @@ fn type_into(buf: &mut Vec<u8>, input: &[u8]) -> (Typed, usize) {
     (Typed::More, input.len())
 }
 
+/// Underline the search hits, as terminal text over the page.
+//
+// the terminal holds the page as one image, so a box drawn
+// into it would mean re-encoding and sending the whole page
+// again. these are cells, and cost a few bytes a frame
+//
+// spaces, not the matched word: a cell over an image at z=-1
+// paints its glyph and not its background, so anything drawn
+// here would land on top of the word rather than behind it.
+// only the underline shows, which is the point
+fn mark(
+    out: &mut impl Write,
+    s: &Shown,
+    view: &View,
+    cells: (u32, u32),
+    cell: CellSize,
+    hits: &[source::Hit],
+    at: usize,
+) -> std::io::Result<()> {
+    let Some(ix) = &s.index else { return Ok(()) };
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let p = placement(s, view, cells, cell);
+
+    for (n, hit) in hits.iter().enumerate() {
+        let Some(line) = ix.lines.get(hit.line) else {
+            continue;
+        };
+
+        // page pixels to cells. the page is drawn 1:1, so a
+        // row is a row and a column is a column
+        let px = f64::from(line.x) + hit.col as f64 * f64::from(line.advance);
+
+        // the last row the box covers, not the first: a
+        // heading sits on the bottom of a box two rows deep,
+        // and underlining the top one strikes it through
+        let last = f64::from(line.y) + f64::from(line.h) - f64::from(ix.row);
+        let row = (last - f64::from(p.src_y)) / f64::from(cell.h);
+        let col = (px - f64::from(p.src_x)) / f64::from(cell.w);
+        if row < 0.0 || col < 0.0 {
+            continue;
+        }
+        let (row, col) = (row.round() as u32, col.round() as u32);
+        if row >= p.rows || col >= p.cols {
+            continue;
+        }
+
+        // a heading's columns are wider than the terminal's,
+        // so the run is measured in pixels and back again
+        let wide = (hit.cols as f64 * f64::from(line.advance) / f64::from(cell.w)).round();
+        let width = (wide.max(1.0) as u32).min(p.cols - col);
+
+        let (r, g, b) = if n == at { MARK } else { MARK_DIM };
+        write!(out, "\x1b[{};{}H", row + 1, col + 1)?;
+
+        // 58 colours the underline itself where the terminal
+        // has it; 38 is what it falls back to otherwise
+        write!(out, "\x1b[4m\x1b[58;2;{r};{g};{b}m\x1b[38;2;{r};{g};{b}m")?;
+        for _ in 0..width {
+            out.write_all(b" ")?;
+        }
+        out.write_all(b"\x1b[0m")?;
+    }
+    Ok(())
+}
+
 /// Whether what is on screen is a page of text rather than a picture.
 fn document(shown: &Option<Shown>) -> bool {
     shown
@@ -545,6 +627,12 @@ fn placement(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Place
         src_y: g.doc_top as u32,
         src_w: g.src_w as u32,
         src_h: g.src_h as u32,
+
+        // a page is written over, a picture is not
+        z: match s.kind {
+            source::Kind::Document => -1,
+            source::Kind::Image => 0,
+        },
         cols: ((g.shown_w / cell.w as f64).ceil() as u32).clamp(1, cells.0.max(1)),
         rows: ((g.shown_h / cell.h as f64).ceil() as u32)
             .clamp(1, cells.1.saturating_sub(1).max(1)),
@@ -610,6 +698,8 @@ fn draw(
     index: usize,
     failure: &Option<String>,
     note: Option<&str>,
+    hits: &[source::Hit],
+    at: usize,
 ) -> std::io::Result<()> {
     // erase from the cursor down clears text but, per the protocol, must not
     // touch graphics; only a full CSI 2 J would drop the image as well
@@ -617,6 +707,7 @@ fn draw(
 
     if let Some(s) = shown {
         kitty::place(out, s.id, &placement(s, view, cells, cell))?;
+        mark(out, s, view, cells, cell, hits, at)?;
     }
 
     let name = files[index]
@@ -951,13 +1042,15 @@ mod tests {
             0,
             &None,
             None,
+            &[],
+            0,
         )
         .unwrap();
         let all = String::from_utf8_lossy(&out).into_owned();
         all.rsplit("\x1b[K").next().unwrap_or_default().to_owned()
     }
 
-    /// A page 4000 pixels tall whose lines sit every `row` pixels.
+    /// A page 4000 pixels tall whose lines sit every 20 pixels.
     fn document(row: f32) -> Shown {
         let mut s = shown(image(400, 4000), source::Kind::Document);
         s.index = Some(source::Index {
@@ -1019,6 +1112,119 @@ mod tests {
                 "a jump to {y} left the window top at {top}"
             );
         }
+    }
+
+    fn marked(s: &Shown, hits: &[source::Hit], at: usize) -> String {
+        let v = View::reset(s, (80, 25), CELL);
+        let mut out = Vec::new();
+        mark(&mut out, s, &v, (80, 25), CELL, hits, at).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_hit_in_view_is_underlined_at_its_own_cell() {
+        // line 3 sits at y=60 with the window top at 0, so it
+        // is the fourth row; column 5 is the sixth column
+        let s = document(20.0);
+        let hits = [source::Hit {
+            line: 3,
+            col: 5,
+            cols: 4,
+        }];
+        let w = marked(&s, &hits, 0);
+        assert!(w.contains("\x1b[4;6H"), "{w:?}");
+        assert!(w.contains("\x1b[4m"), "underlined: {w:?}");
+        assert!(w.contains("58;2;255;95;175"), "coloured underline: {w:?}");
+        assert!(w.contains("    \x1b[0m"), "four cells wide: {w:?}");
+    }
+
+    #[test]
+    fn only_the_hit_you_are_on_takes_the_bright_colour() {
+        let s = document(20.0);
+        let hits = [
+            source::Hit {
+                line: 1,
+                col: 0,
+                cols: 2,
+            },
+            source::Hit {
+                line: 2,
+                col: 0,
+                cols: 2,
+            },
+        ];
+        let w = marked(&s, &hits, 1);
+        assert_eq!(w.matches("58;2;255;95;175").count(), 1, "{w:?}");
+        assert_eq!(w.matches("58;2;143;63;111").count(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn nothing_but_spaces_is_ever_written_over_the_page() {
+        // the page's own text stays visible underneath, and a
+        // document cannot put characters on the terminal
+        let mut s = document(20.0);
+        s.index.as_mut().unwrap().lines[0].text = "a\x1b[2Jb".into();
+        let hits = [source::Hit {
+            line: 0,
+            col: 0,
+            cols: 5,
+        }];
+        let w = marked(&s, &hits, 0);
+        assert!(!w.contains("\x1b[2J"), "{w:?}");
+
+        let printable: String = w
+            .split("\x1b")
+            .skip(1)
+            .filter_map(|p| p.split_once(|c: char| c.is_ascii_alphabetic()))
+            .map(|(_, tail)| tail.to_owned())
+            .collect();
+        assert!(
+            printable.chars().all(|c| c == ' '),
+            "wrote {printable:?} as well as spaces"
+        );
+    }
+
+    #[test]
+    fn a_heading_is_underlined_on_the_last_row_of_its_box() {
+        // a two-row heading sits on the bottom of its box, so
+        // underlining the first row would strike it through
+        let mut s = document(20.0);
+        {
+            let ix = s.index.as_mut().unwrap();
+            ix.lines[2].h = 40.0;
+        }
+        let hits = [source::Hit {
+            line: 2,
+            col: 0,
+            cols: 3,
+        }];
+        let w = marked(&s, &hits, 0);
+
+        // line 2 starts at y=40, its box ends at y=80, so the
+        // row to draw on starts at y=60: the fourth row
+        assert!(w.contains("\x1b[4;1H"), "{w:?}");
+    }
+
+    #[test]
+    fn a_hit_below_the_window_is_not_written() {
+        let s = document(20.0);
+        let hits = [source::Hit {
+            line: 190,
+            col: 0,
+            cols: 4,
+        }];
+        assert_eq!(marked(&s, &hits, 0), "");
+    }
+
+    #[test]
+    fn a_page_is_placed_under_the_text_layer_and_a_picture_is_not() {
+        let doc = document(20.0);
+        let v = View::reset(&doc, (80, 25), CELL);
+        assert_eq!(placement(&doc, &v, (80, 25), CELL).z, -1);
+
+        let pic = shown(image(400, 4000), source::Kind::Image);
+        let v = View::reset(&pic, (80, 25), CELL);
+        assert_eq!(placement(&pic, &v, (80, 25), CELL).z, 0);
     }
 
     #[test]

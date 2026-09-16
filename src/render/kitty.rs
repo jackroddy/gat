@@ -34,6 +34,13 @@ pub struct Placement {
     /// Height of the source rectangle, in image pixels.
     pub src_h: u32,
 
+    /// Where the image sits relative to the terminal's text.
+    //
+    // negative puts it under the text layer, which is what
+    // lets the viewer write over the page without touching a
+    // pixel of it
+    pub z: i32,
+
     /// Width of the destination box, in terminal cells.
     pub cols: u32,
 
@@ -140,13 +147,14 @@ pub fn emit(
 pub fn place(out: &mut impl Write, id: u32, p: &Placement) -> io::Result<()> {
     write!(
         out,
-        "\x1b_Ga=p,i={id},p={PLACEMENT},q=2,C=1,x={x},y={y},w={w},h={h},c={c},r={r};\x1b\\",
+        "\x1b_Ga=p,i={id},p={PLACEMENT},q=2,C=1,x={x},y={y},w={w},h={h},c={c},r={r},z={z};\x1b\\",
         x = p.src_x,
         y = p.src_y,
         w = p.src_w,
         h = p.src_h,
         c = p.cols,
         r = p.rows,
+        z = p.z,
     )
 }
 
