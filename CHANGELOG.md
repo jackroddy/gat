@@ -4,32 +4,26 @@ This file records every notable change to gat.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Nothing has been released yet, so everything so far sits under Unreleased.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-16
+
 ### Added
 
-- Show PNG, JPEG, PDF, SVG and Markdown in a terminal that speaks the Kitty
-  graphics protocol. PDF goes through hayro by default, or pdfium behind the
-  `pdf-pdfium` feature.
-- A viewer on the alternate screen that pans, and zooms a picture. It transmits
-  a page once and scrolls by asking the terminal for a different part of the
-  pixels it already holds, so a keypress costs 69 bytes.
-- `--print`, which writes an image where the cursor is and exits. It runs
-  whether or not stdout is a terminal, so pipes and redirects work.
-- Markdown drawn as a page: headings at real sizes, tables, task lists,
-  footnotes, GitHub callouts, block quotes, and code blocks coloured by
-  language through syntect, behind the `syntax` feature.
+- Tables, task lists, footnotes and GitHub callouts in Markdown. A table is
+  measured in characters and its widest column shrinks first, so a column of
+  prose wraps before a column of short keys is squeezed.
+- Code blocks coloured by language through syntect, behind the `syntax`
+  feature. A fence naming no language draws in one colour as before.
 - Search in the viewer. gat underlines the matches over the page as terminal
   text, which costs no pixels, and steps through headings the same way.
 - Vim's keys: `hjkl` and the arrows pan, `g` and `G` are the ends, `/` and `?`
   search, `n` and `N` step matches, `}` and `{` step headings, tab and
   shift-tab change file.
 - `--keep`, which leaves the images of earlier runs in the terminal.
-- `--probe`, which reports what terminal detection saw.
-- Terminal detection over ssh. It sizes its waits from one measured round trip
-  instead of a fixed timeout.
+- Bare URLs take the link colour, and YAML or TOML front matter is dropped
+  instead of drawing as a rule and a paragraph of fields.
 
 ### Changed
 
@@ -61,3 +55,22 @@ Nothing has been released yet, so everything so far sits under Unreleased.
   reach the network.
 - Text from a document reaches the SVG only as character data, escaped, and
   nothing a document contains is written to the terminal as characters.
+
+## [0.1.0] - 2026-09-15
+
+### Added
+
+- Show PNG, JPEG, PDF, SVG and Markdown in a terminal that speaks the Kitty
+  graphics protocol. PDF goes through hayro by default, or pdfium behind the
+  `pdf-pdfium` feature.
+- A viewer on the alternate screen that pans and zooms. It transmits a page
+  once and scrolls by asking the terminal for a different part of the pixels it
+  already holds, so a keypress costs 69 bytes.
+- `--print`, which writes an image where the cursor is and exits. It runs
+  whether or not stdout is a terminal, so pipes and redirects work.
+- Markdown drawn as a page rather than styled terminal text, at the size of the
+  terminal's own text, and written into the scrollback in pieces.
+- `--probe`, which reports what terminal detection saw, and `--force-kitty`,
+  which skips detection.
+- Terminal detection over ssh. It sizes its waits from one measured round trip
+  instead of a fixed timeout.
