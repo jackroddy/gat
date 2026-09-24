@@ -24,9 +24,11 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Framebuffer, Error> {
     // vector input, so rasterize at display size; both
     // bounds are given because which one binds depends on
     // the page aspect ratio
+    let (pw, ph) = (page.width().value, page.height().value);
+    let scale = crate::source::vector_scale(pw, ph, hints);
     let config = PdfRenderConfig::new()
-        .set_target_width(hints.max_w as i32)
-        .set_maximum_height(hints.max_h as i32);
+        .set_target_width((pw * scale).round().max(1.0) as i32)
+        .set_maximum_height((ph * scale).round().max(1.0) as i32);
 
     let image = page
         .render_with_config(&config)

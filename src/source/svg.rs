@@ -12,12 +12,7 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Framebuffer, Error> {
 
     // SVG has no pixel size of its own, so rasterize straight at the size
     // it will be displayed at rather than scaling a bitmap afterwards
-    let scale = (hints.max_w as f32 / size.width())
-        .min(hints.max_h as f32 / size.height())
-        // a zero-size tree gives scale 0 and a 0x0 pixmap
-        .max(f32::MIN_POSITIVE);
-
-    rasterize(&tree, scale)
+    rasterize(&tree, crate::source::vector_scale(size.width(), size.height(), hints))
 }
 
 /// Draw `tree` at `scale` into a straight-alpha framebuffer.

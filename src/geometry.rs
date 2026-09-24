@@ -41,11 +41,16 @@ pub struct Budget {
     pub fill_height: bool,
 }
 
-/// Compute how many times too large `w` by `h` is to fit within `cap` on
-/// both sides: 1 where it already fits.
-pub fn over_cap(w: f64, h: f64, cap: u32) -> f64 {
-    let cap = f64::from(cap.max(1));
-    (w / cap).max(h / cap).max(1.0)
+/// Compute how many times to shrink each side of `w` by `h` to bring it
+/// within `max_px` pixels: 1 where it already fits.
+pub fn over_cap(w: f64, h: f64, max_px: u64) -> f64 {
+    (w * h / max_px.max(1) as f64).sqrt().max(1.0)
+}
+
+/// Compute how many times to shrink a width `w` to bring it within the side
+/// of a square of `max_px` pixels: 1 where it already fits.
+pub fn over_width(w: f64, max_px: u64) -> f64 {
+    (w / (max_px.max(1) as f64).sqrt()).max(1.0)
 }
 
 /// Compute the pixel size to render at: the largest scaling of `img_w` by
@@ -137,10 +142,13 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_shrinks_by_the_longer_side_and_never_grows() {
-        assert_eq!(over_cap(800.0, 600.0, 1024), 1.0);
-        assert_eq!(over_cap(2048.0, 600.0, 1024), 2.0);
-        assert_eq!(over_cap(600.0, 4096.0, 1024), 4.0);
+    fn the_cap_shrinks_by_area_and_never_grows() {
+        assert_eq!(over_cap(800.0, 600.0, 1 << 20), 1.0);
+        assert_eq!(over_cap(2048.0, 2048.0, 1 << 20), 2.0);
+        // a long thin picture may pass 1024 a side, and does
+        assert_eq!(over_cap(4096.0, 256.0, 1 << 20), 1.0);
+        assert_eq!(over_width(2048.0, 1 << 20), 2.0);
+        assert_eq!(over_width(800.0, 1 << 20), 1.0);
     }
 
     #[test]

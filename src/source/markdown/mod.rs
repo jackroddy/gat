@@ -107,7 +107,7 @@ fn lay_out(bytes: &[u8], hints: Hints) -> (layout::Page, layout::Theme, f32, f64
     // measuring it at the terminal's own cell says how much
     // coarser the cap needs the page drawn, before any layout
     let full = page_width(&theme_for(hints.cell, 1.0), hints.max_w as f32);
-    let (cell, per) = hints.cell.coarser(f64::from(full) / f64::from(hints.cap.max(1)));
+    let (cell, per) = hints.cell.coarser(crate::geometry::over_width(f64::from(full), hints.max_px));
     let theme = theme_for(cell, per);
     let width = page_width(&theme, (f64::from(hints.max_w) / per) as f32);
 
@@ -204,7 +204,7 @@ mod tests {
             max_w: w,
             max_h: h,
             cell: CellSize { w: 14.0, h: 32.0 },
-            cap: u32::MAX,
+            max_px: u64::MAX,
         }
     }
 
@@ -256,7 +256,7 @@ mod tests {
             max_w: 88 * 20,
             max_h: u32::MAX,
             cell: CellSize { w: 20.0, h: 40.0 },
-            cap: 1024,
+            max_px: 1 << 20,
         };
         let (page, theme, width, per) = lay_out(md, hints);
         assert!(width <= 1024.0, "page is {width} wide");
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn a_page_under_the_cap_is_drawn_at_the_terminals_own_size() {
         let hints = Hints {
-            cap: 4096,
+            max_px: 1 << 24,
             ..hints(800, u32::MAX)
         };
         let (_, _, _, per) = lay_out(b"words\n", hints);

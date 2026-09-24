@@ -25,9 +25,9 @@ pub struct Hints {
     // text around it
     pub cell: crate::geometry::CellSize,
 
-    /// The most pixels a side of the result may have: both sides of a
-    /// picture, only the width of a document.
-    pub cap: u32,
+    /// The most pixels the result may have: in all for a picture, and for a
+    /// document a width of at most the square root.
+    pub max_px: u64,
 }
 
 /// A decoded source.
@@ -255,12 +255,12 @@ pub fn load(bytes: &[u8], path: &Path, #[cfg_attr(not(any(feature = "svg", featu
             .map_err(|e| Error::Decode(e.to_string())),
 
         #[cfg(feature = "svg")]
-        Format::Svg => svg::load(bytes, capped(hints)).map(|fb| vector(fb, hints)),
+        Format::Svg => svg::load(bytes, hints).map(|fb| vector(fb, hints)),
         #[cfg(not(feature = "svg"))]
         Format::Svg => Err(Error::Unsupported("SVG (rebuild with --features svg)")),
 
         #[cfg(any(feature = "pdf", feature = "pdf-pdfium"))]
-        Format::Pdf => pdf::load(bytes, capped(hints)).map(|fb| vector(fb, hints)),
+        Format::Pdf => pdf::load(bytes, hints).map(|fb| vector(fb, hints)),
         #[cfg(not(any(feature = "pdf", feature = "pdf-pdfium")))]
         Format::Pdf => Err(Error::Unsupported("PDF (rebuild with --features pdf)")),
 
@@ -328,27 +328,24 @@ fn whole(fb: Framebuffer) -> Loaded {
     }
 }
 
-/// The box a vector source is drawn into, held to the cap.
-//
-// a contain-fit into a box and then under the cap is the same
-// as a contain-fit into the box clipped to the cap, which lets
-// the decoder rasterize at the final size rather than
-// downsampling afterwards
+/// Compute the scale to rasterize a vector source `w` by `h` at: a
+/// contain-fit into the hints' box, held to their pixel cap.
 #[cfg_attr(not(any(feature = "svg", feature = "pdf", feature = "pdf-pdfium")), allow(dead_code))]
-fn capped(hints: Hints) -> Hints {
-    Hints {
-        max_w: hints.max_w.min(hints.cap),
-        max_h: hints.max_h.min(hints.cap),
-        ..hints
-    }
+pub fn vector_scale(w: f32, h: f32, hints: Hints) -> f32 {
+    let fit = (hints.max_w as f32 / w).min(hints.max_h as f32 / h);
+    let cap = (hints.max_px as f64 / (f64::from(w) * f64::from(h))).sqrt() as f32;
+
+    // a zero-size source gives scale 0 and a 0x0 pixmap
+    fit.min(cap).max(f32::MIN_POSITIVE)
 }
 
-/// Wrap a vector source drawn into `capped(hints)`.
+/// Wrap a vector source drawn at `vector_scale`.
 #[cfg_attr(not(any(feature = "svg", feature = "pdf", feature = "pdf-pdfium")), allow(dead_code))]
 fn vector(fb: Framebuffer, hints: Hints) -> Loaded {
-    // uncapped, the drawing fills the box along one axis, so
-    // the ratio along that axis is what the cap took off. the
-    // other axis has room to spare and gives a larger ratio
+    // uncapped, the drawing fills the box along one axis, and
+    // the cap shrinks both axes alike, so the ratio along that
+    // axis is what the cap took off. the other axis has room
+    // to spare and gives a larger ratio
     let per = (f64::from(hints.max_w) / f64::from(fb.width().max(1)))
         .min(f64::from(hints.max_h) / f64::from(fb.height().max(1)))
         .max(1.0);

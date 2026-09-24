@@ -19,10 +19,7 @@ pub fn load(bytes: &[u8], hints: Hints) -> Result<Framebuffer, Error> {
         .ok_or_else(|| Error::Decode("PDF has no pages".into()))?;
 
     let (pw, ph) = page.render_dimensions();
-    let scale = (hints.max_w as f32 / pw)
-        .min(hints.max_h as f32 / ph)
-        // a zero-size page gives scale 0 and a 0x0 pixmap
-        .max(f32::MIN_POSITIVE);
+    let scale = crate::source::vector_scale(pw, ph, hints);
 
     let settings = InterpreterSettings {
         // without a resolver, a page that names a font instead of embedding

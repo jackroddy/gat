@@ -65,18 +65,18 @@ const MARK_DIM: (u8, u8, u8) = (0x8f, 0x3f, 0x6f);
 const ZOOM_IN: f64 = 1.25;
 const ZOOM_OUT: f64 = 0.8;
 
-/// Run the viewer over `files`, sending no image more than `cap` pixels a
-/// side.
+/// Run the viewer over `files`, sending no image of more than `max_px`
+/// pixels.
 pub fn run(
     files: &[PathBuf],
     cell: CellSize,
-    cap: u32,
+    max_px: u64,
     background: [u8; 3],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut tty = RawTty::open().ok_or("cannot open /dev/tty")?;
     let _screen = Screen::enter()?;
     let mut out = BufWriter::new(std::io::stdout());
-    event_loop(&mut out, &mut tty, files, cell, cap, background)
+    event_loop(&mut out, &mut tty, files, cell, max_px, background)
 }
 
 /// The alternate screen buffer, left on drop.
@@ -219,7 +219,7 @@ fn event_loop(
     tty: &mut RawTty,
     files: &[PathBuf],
     cell: CellSize,
-    cap: u32,
+    max_px: u64,
     background: [u8; 3],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let continuation = if term::over_ssh() {
@@ -265,7 +265,7 @@ fn event_loop(
 
             // replacing the job drops the receiver, so a
             // superseded worker's result is discarded
-            loading = Some(spawn_load(files[index].clone(), cells, cell, cap, background));
+            loading = Some(spawn_load(files[index].clone(), cells, cell, max_px, background));
         }
 
         if let Some(job) = &loading {
@@ -899,7 +899,7 @@ fn load(
     path: &Path,
     cells: (u32, u32),
     cell: CellSize,
-    cap: u32,
+    max_px: u64,
     background: [u8; 3],
 ) -> Result<Shown, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
@@ -920,7 +920,7 @@ fn load(
             source::Kind::Image => (f64::from(cells.1 * headroom) * cell.h) as u32,
         },
         cell,
-        cap,
+        max_px,
     };
     let loaded = source::load(&bytes, path, hints)?;
     let (decoded, mut index, drawn) = (loaded.fb, loaded.index, loaded.per);
@@ -939,8 +939,8 @@ fn load(
     // a document's height is its length, so only its width
     // is held to the cap
     let over = match kind {
-        source::Kind::Document => geometry::over_cap(dw * fit, 0.0, cap),
-        source::Kind::Image => geometry::over_cap(dw * fit, dh * fit, cap),
+        source::Kind::Document => geometry::over_width(dw * fit, max_px),
+        source::Kind::Image => geometry::over_cap(dw * fit, dh * fit, max_px),
     };
     let scale = fit / over;
     let mut fb = if scale < 1.0 {
@@ -1025,12 +1025,12 @@ fn spawn_load(
     path: PathBuf,
     cells: (u32, u32),
     cell: CellSize,
-    cap: u32,
+    max_px: u64,
     background: [u8; 3],
 ) -> Loading {
     let (tx, done) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = load(&path, cells, cell, cap, background).map_err(|e| e.to_string());
+        let result = load(&path, cells, cell, max_px, background).map_err(|e| e.to_string());
 
         // the receiver is gone if the viewer has moved on
         let _ = tx.send(result);

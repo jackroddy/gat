@@ -22,12 +22,12 @@ struct Args {
     force: bool,
     print: bool,
     keep: bool,
-    cap: u32,
+    max_px: u64,
 }
 
-/// The most pixels a side of an image sent to the terminal may have, unless
-/// `--cap` says otherwise.
-const CAP: u32 = 1024;
+/// The most pixels an image sent to the terminal may have, unless `--cap`
+/// says otherwise.
+const MAX_PX: u64 = 1024 * 1024;
 
 /// Where the one-shot renderer's image ids come from.
 enum Ids {
@@ -87,7 +87,7 @@ fn main() -> ExitCode {
     // both, a piped or redirected run still gets the one-shot rendering
     let interactive = !args.print && rustix::termios::isatty(rustix::stdio::stdout());
     if interactive {
-        if let Err(e) = tui::run(&args.files, terminal.cell, args.cap, args.background) {
+        if let Err(e) = tui::run(&args.files, terminal.cell, args.max_px, args.background) {
             eprintln!("gat: {e}");
             return ExitCode::FAILURE;
         }
@@ -112,7 +112,7 @@ fn main() -> ExitCode {
     };
 
     for path in &args.files {
-        if let Err(e) = show(&mut out, path, &budget, args.cap, args.background, &mut ids) {
+        if let Err(e) = show(&mut out, path, &budget, args.max_px, args.background, &mut ids) {
             let _ = out.flush();
             eprintln!("gat: {}: {e}", path.display());
             failed = true;
@@ -129,7 +129,7 @@ fn show(
     out: &mut impl Write,
     path: &std::path::Path,
     budget: &Budget,
-    cap: u32,
+    max_px: u64,
     background: [u8; 3],
     ids: &mut Ids,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -146,7 +146,7 @@ fn show(
             (f64::from(budget.rows) * budget.cell.h) as u32
         },
         cell: budget.cell,
-        cap,
+        max_px,
     };
 
     let pieces = source::pieces(&bytes, path, hints)?;
@@ -166,7 +166,7 @@ fn show(
                 (dh * drawn).round() as u32,
                 budget,
             );
-            let over = geometry::over_cap(f64::from(w), f64::from(h), cap);
+            let over = geometry::over_cap(f64::from(w), f64::from(h), max_px);
             let (fw, fh) = (
                 (f64::from(w) / over).round().max(1.0),
                 (f64::from(h) / over).round().max(1.0),
@@ -218,7 +218,7 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
         force: false,
         print: false,
         keep: false,
-        cap: CAP,
+        max_px: MAX_PX,
     };
 
     let mut parser = lexopt::Parser::from_env();
@@ -239,15 +239,7 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Long("fit-height") => args.fill_height = true,
             Long("force-kitty") => args.force = true,
             Short('p') | Long("print") => args.print = true,
-            Long("cap") => {
-                args.cap = parser
-                    .value()?
-                    .string()?
-                    .parse()
-                    .ok()
-                    .filter(|&n| n > 0)
-                    .ok_or_else(|| lexopt::Error::from("cap wants a pixel count above 0"))?;
-            }
+            Long("cap") => args.max_px = parse_pixels(&parser.value()?.string()?)?,
             Long("keep") => args.keep = true,
             Long("probe") => {
                 print!("terminal probe:\n{}", term::explain());
@@ -284,6 +276,23 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
     Ok(Some(args))
 }
 
+/// Parse a pixel count: a whole number, or one with a K or M suffix for
+/// thousands or millions, as in `2M` or `1.5M`.
+fn parse_pixels(s: &str) -> Result<u64, lexopt::Error> {
+    let bad = || lexopt::Error::from("cap wants a pixel count such as 1048576 or 2M");
+    let (num, unit) = match s.char_indices().last() {
+        Some((i, 'k' | 'K')) => (&s[..i], 1e3),
+        Some((i, 'm' | 'M')) => (&s[..i], 1e6),
+        _ => (s, 1.0),
+    };
+    let n: f64 = num.parse().map_err(|_| bad())?;
+    let px = (n * unit).round();
+    if !(px >= 1.0 && px < u64::MAX as f64) {
+        return Err(bad());
+    }
+    Ok(px as u64)
+}
+
 fn parse_color(s: &str) -> Result<[u8; 3], lexopt::Error> {
     let hex = s.strip_prefix('#').unwrap_or(s);
     if hex.len() != 6 {
@@ -306,11 +315,28 @@ usage: gat [options] <file>...
       --fit-height     use the full height, letting width overflow
   -b, --background C   composite transparency over color C (#rrggbb)
   -p, --print          write the image to stdout and exit, no viewer
-      --cap N          send no image wider or taller than N pixels (1024);
-                       a document is capped on width only
+      --cap N          send no image of more than N pixels (1048576), as
+                       a count or with K or M; a document's width is held
+                       to the square root instead
       --keep           leave images from earlier runs in the terminal
       --force-kitty    emit kitty sequences even if detection says no
       --probe          report what terminal detection sees, then exit
   -h, --help           this text
   -V, --version        version
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pixel_count_takes_a_suffix_or_none() {
+        assert_eq!(parse_pixels("1048576").unwrap(), 1_048_576);
+        assert_eq!(parse_pixels("2M").unwrap(), 2_000_000);
+        assert_eq!(parse_pixels("1.5m").unwrap(), 1_500_000);
+        assert_eq!(parse_pixels("500K").unwrap(), 500_000);
+        for bad in ["", "0", "M", "-1", "2G", "1e30M", "NaN"] {
+            assert!(parse_pixels(bad).is_err(), "{bad:?} parsed");
+        }
+    }
+}
