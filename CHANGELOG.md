@@ -7,6 +7,31 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `-p`, short for `--print`.
+- `--cap N`, the most pixels an image gat sends may have: 1048576 unless the
+  settings file or the flag says otherwise, written as a count or with K or M,
+  as in `2M`. A picture over the cap is shrunk once with its aspect kept, and
+  the terminal scales it back up into the cells it would have covered. SVG and
+  PDF are rasterized at the capped size directly. A document's width is held to
+  the square root of the cap, and its text stays one terminal row per line and
+  one cell per character.
+- A settings file, `$XDG_CONFIG_HOME/gat/config.toml` or
+  `~/.config/gat/config.toml`, with `mode` for whether a run opens the viewer
+  or prints, and `cap`. gat writes one with both settings commented out the
+  first time it runs without one. A flag wins over the file, and a mistake in
+  the file is an error naming its line.
+- `-i`, `--interactive`, which opens the viewer when the settings file says
+  print. With stdout not a terminal it is an error, where a run without it
+  prints.
+
+### Changed
+
+- gat no longer sends an image at the full resolution of a large window. Past
+  the cap, a picture, or a page at a large font size, goes out with fewer
+  pixels and the terminal enlarges it, which can look softer than before.
+
 ## [0.2.0] - 2026-09-16
 
 ### Added
