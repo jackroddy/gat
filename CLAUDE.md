@@ -15,6 +15,7 @@ cargo run -- --print img/roc.pdf    # one-shot render, then exit
 cargo run -- x.svg
 cargo run -- README.md
 cargo build --release
+cargo build --profile dist                         # smaller, with a 50s link
 cargo build --no-default-features --features png   # a smaller binary
 ```
 
@@ -72,10 +73,11 @@ precedence.
 ## Design constraints
 
 Be stingy with dependencies, but not at the cost of the thing working out of
-the box. Every format ships in the default build, which costs 115 crates and an
-11.8M binary: hayro is most of the crates, resvg most of the rest, and markdown
-adds only two beyond what resvg already dragged in, plus 1.2M of compiled-in
-font. For comparison, `--no-default-features` is 18 crates.
+the box. Every format ships in the default build, which costs 115 crates and a
+14.2M binary, or 11.8M built with `--profile dist`: hayro is most of the
+crates, resvg most of the rest, and markdown adds only two beyond what resvg
+already dragged in, plus 1.2M of compiled-in font. For comparison,
+`--no-default-features` is 18 crates.
 
 Syntax colouring is 14 of those crates and 2.1M of that binary, which is why it
 carries a feature of its own. The alternative was a hand-written highlighter
