@@ -202,7 +202,7 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Short('W') | Long("fit-width") => args.fill_width = true,
             Long("fit-height") => args.fill_height = true,
             Long("force-kitty") => args.force = true,
-            Long("print") => args.print = true,
+            Short('p') | Long("print") => args.print = true,
             Long("keep") => args.keep = true,
             Long("probe") => {
                 print!("terminal probe:\n{}", term::explain());
@@ -257,7 +257,7 @@ usage: gat [options] <file>...
   -W, --fit-width      use the full width, letting height overflow
       --fit-height     use the full height, letting width overflow
   -b, --background C   composite transparency over color C (#rrggbb)
-      --print          write the image to stdout and exit, no viewer
+  -p, --print          write the image to stdout and exit, no viewer
       --keep           leave images from earlier runs in the terminal
       --force-kitty    emit kitty sequences even if detection says no
       --probe          report what terminal detection sees, then exit
