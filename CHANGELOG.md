@@ -7,6 +7,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-23
+
 ### Added
 
 - `-p`, short for `--print`.
@@ -31,6 +33,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - gat no longer sends an image at the full resolution of a large window. Past
   the cap, a picture, or a page at a large font size, goes out with fewer
   pixels and the terminal enlarges it, which can look softer than before.
+- A release build, which is what `cargo install` makes, takes about 17 seconds
+  where it took 51, or under a second when only gat's own code has changed, and
+  comes out at 14.2M where it was 11.8M. `cargo build --profile dist` builds
+  the smaller binary the old way.
 
 ## [0.2.0] - 2026-09-16
 
