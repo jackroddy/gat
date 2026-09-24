@@ -1,3 +1,4 @@
+mod config;
 mod framebuffer;
 mod geometry;
 mod render;
@@ -9,6 +10,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use config::Mode;
 use geometry::Budget;
 use term::Protocol;
 
@@ -20,9 +22,11 @@ struct Args {
     fill_height: bool,
     background: [u8; 3],
     force: bool,
-    print: bool,
+
+    /// `-p` or `-i`, whichever came last.
+    mode: Option<Mode>,
     keep: bool,
-    max_px: u64,
+    max_px: Option<u64>,
 }
 
 /// The most pixels an image sent to the terminal may have, unless `--cap`
@@ -61,6 +65,27 @@ fn main() -> ExitCode {
         }
     };
 
+    // read after the arguments, so --help and --version work
+    // with a broken config file
+    let config = match config::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("gat: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let max_px = args.max_px.or(config.max_px).unwrap_or(MAX_PX);
+
+    // the viewer needs a terminal to draw on and a keyboard to read; without
+    // both, a piped or redirected run still gets the one-shot rendering,
+    // unless -i asked for the viewer by name
+    let tty = rustix::termios::isatty(rustix::stdio::stdout());
+    if args.mode == Some(Mode::View) && !tty {
+        eprintln!("gat: -i needs a terminal on stdout");
+        return ExitCode::from(2);
+    }
+    let interactive = tty && args.mode.or(config.mode).unwrap_or(Mode::View) == Mode::View;
+
     let terminal = term::Terminal::detect();
     if terminal.protocol != Protocol::Kitty && !args.force {
         eprintln!(
@@ -83,11 +108,8 @@ fn main() -> ExitCode {
         fill_height: args.fill_height,
     };
 
-    // the viewer needs a terminal to draw on and a keyboard to read; without
-    // both, a piped or redirected run still gets the one-shot rendering
-    let interactive = !args.print && rustix::termios::isatty(rustix::stdio::stdout());
     if interactive {
-        if let Err(e) = tui::run(&args.files, terminal.cell, args.max_px, args.background) {
+        if let Err(e) = tui::run(&args.files, terminal.cell, max_px, args.background) {
             eprintln!("gat: {e}");
             return ExitCode::FAILURE;
         }
@@ -112,7 +134,7 @@ fn main() -> ExitCode {
     };
 
     for path in &args.files {
-        if let Err(e) = show(&mut out, path, &budget, args.max_px, args.background, &mut ids) {
+        if let Err(e) = show(&mut out, path, &budget, max_px, args.background, &mut ids) {
             let _ = out.flush();
             eprintln!("gat: {}: {e}", path.display());
             failed = true;
@@ -216,9 +238,9 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
         fill_height: false,
         background: [0, 0, 0],
         force: false,
-        print: false,
+        mode: None,
         keep: false,
-        max_px: MAX_PX,
+        max_px: None,
     };
 
     let mut parser = lexopt::Parser::from_env();
@@ -238,8 +260,12 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Short('W') | Long("fit-width") => args.fill_width = true,
             Long("fit-height") => args.fill_height = true,
             Long("force-kitty") => args.force = true,
-            Short('p') | Long("print") => args.print = true,
-            Long("cap") => args.max_px = parse_pixels(&parser.value()?.string()?)?,
+            Short('p') | Long("print") => args.mode = Some(Mode::Print),
+            Short('i') | Long("interactive") => args.mode = Some(Mode::View),
+            Long("cap") => {
+                let raw = parser.value()?.string()?;
+                args.max_px = Some(config::parse_pixels(&raw).map_err(lexopt::Error::from)?);
+            }
             Long("keep") => args.keep = true,
             Long("probe") => {
                 print!("terminal probe:\n{}", term::explain());
@@ -276,23 +302,6 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
     Ok(Some(args))
 }
 
-/// Parse a pixel count: a whole number, or one with a K or M suffix for
-/// thousands or millions, as in `2M` or `1.5M`.
-fn parse_pixels(s: &str) -> Result<u64, lexopt::Error> {
-    let bad = || lexopt::Error::from("cap wants a pixel count such as 1048576 or 2M");
-    let (num, unit) = match s.char_indices().last() {
-        Some((i, 'k' | 'K')) => (&s[..i], 1e3),
-        Some((i, 'm' | 'M')) => (&s[..i], 1e6),
-        _ => (s, 1.0),
-    };
-    let n: f64 = num.parse().map_err(|_| bad())?;
-    let px = (n * unit).round();
-    if !(px >= 1.0 && px < u64::MAX as f64) {
-        return Err(bad());
-    }
-    Ok(px as u64)
-}
-
 fn parse_color(s: &str) -> Result<[u8; 3], lexopt::Error> {
     let hex = s.strip_prefix('#').unwrap_or(s);
     if hex.len() != 6 {
@@ -315,6 +324,7 @@ usage: gat [options] <file>...
       --fit-height     use the full height, letting width overflow
   -b, --background C   composite transparency over color C (#rrggbb)
   -p, --print          write the image to stdout and exit, no viewer
+  -i, --interactive    open the viewer, the default unless config says print
       --cap N          send no image of more than N pixels (1048576), as
                        a count or with K or M; a document's width is held
                        to the square root instead
@@ -323,20 +333,9 @@ usage: gat [options] <file>...
       --probe          report what terminal detection sees, then exit
   -h, --help           this text
   -V, --version        version
+
+settings: $XDG_CONFIG_HOME/gat/config.toml, or ~/.config/gat/config.toml
+  mode = \"print\" | \"view\"   what to do with no -p or -i
+  cap = 1048576 | \"2M\"      the --cap default
 ";
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_pixel_count_takes_a_suffix_or_none() {
-        assert_eq!(parse_pixels("1048576").unwrap(), 1_048_576);
-        assert_eq!(parse_pixels("2M").unwrap(), 2_000_000);
-        assert_eq!(parse_pixels("1.5m").unwrap(), 1_500_000);
-        assert_eq!(parse_pixels("500K").unwrap(), 500_000);
-        for bad in ["", "0", "M", "-1", "2G", "1e30M", "NaN"] {
-            assert!(parse_pixels(bad).is_err(), "{bad:?} parsed");
-        }
-    }
-}
