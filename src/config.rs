@@ -14,16 +14,54 @@ pub struct Config {
     pub max_px: Option<u64>,
 }
 
-/// Read the config file, or the defaults where there is none.
+/// The file gat writes where there is none: every setting, commented out at
+/// its default.
+const DEFAULT: &str = "\
+# gat settings. Uncomment a line to change it; a flag on the command line
+# wins over this file.
+
+# what a run does with neither -p nor -i: \"view\" or \"print\"
+# mode = \"view\"
+
+# the most pixels an image sent to the terminal may have, as a count or as a
+# string such as \"2M\". a document's width is held to the square root
+# cap = 1048576
+";
+
+/// Read the config file, or the defaults where there is none, writing the
+/// default file in that case.
 pub fn load() -> Result<Config, String> {
     let Some(path) = path() else {
         return Ok(Config::default());
     };
     match std::fs::read_to_string(&path) {
         Ok(text) => parse(&text).map_err(|(line, e)| format!("{}:{line}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // a home gat cannot write to is no reason to refuse
+            // to show a picture, so a failure here is dropped
+            if write_default(&path).is_ok() {
+                eprintln!("gat: wrote default settings to {}", path.display());
+            }
+            Ok(Config::default())
+        }
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
+}
+
+fn write_default(path: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    // create_new, so two runs starting at once cannot both
+    // write, and a file that appeared since the read survives
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(DEFAULT.as_bytes())
 }
 
 /// Where the config file lives: `$XDG_CONFIG_HOME/gat/config.toml`, falling
@@ -180,6 +218,26 @@ mod tests {
             let got = parse(text);
             assert!(matches!(got, Err((n, _)) if n == line), "{text:?} gave {got:?}");
         }
+    }
+
+    #[test]
+    fn the_default_file_sets_nothing_and_uncommented_gives_the_defaults() {
+        // commented out, so a later default reaches a user who
+        // never edited the file
+        assert_eq!(parse(DEFAULT), Ok(Config::default()));
+
+        let live: String = DEFAULT
+            .lines()
+            .map(|l| l.strip_prefix("# ").filter(|l| l.contains(" = ")).unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            parse(&live),
+            Ok(Config {
+                mode: Some(Mode::View),
+                max_px: Some(crate::MAX_PX),
+            })
+        );
     }
 
     #[test]
