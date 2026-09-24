@@ -48,9 +48,15 @@ pub struct Placement {
     pub rows: u32,
 }
 
-/// Write `fb` as a Kitty graphics command that displays it at the cursor.
-pub fn write(out: &mut impl Write, fb: &Framebuffer, id: u32) -> io::Result<()> {
-    send(out, fb, id, true)
+/// Write `fb` as a Kitty graphics command that displays it at the cursor,
+/// scaled into `cells` columns by rows where given.
+pub fn write(
+    out: &mut impl Write,
+    fb: &Framebuffer,
+    id: u32,
+    cells: Option<(u32, u32)>,
+) -> io::Result<()> {
+    send(out, fb, id, true, cells)
 }
 
 /// A framebuffer compressed and ready to be written out.
@@ -76,10 +82,16 @@ pub fn encode(fb: &Framebuffer) -> io::Result<Encoded> {
     })
 }
 
-fn send(out: &mut impl Write, fb: &Framebuffer, id: u32, display: bool) -> io::Result<()> {
+fn send(
+    out: &mut impl Write,
+    fb: &Framebuffer,
+    id: u32,
+    display: bool,
+    cells: Option<(u32, u32)>,
+) -> io::Result<()> {
     // nothing reads the tty after the one-shot path writes,
     // so an unread reply would land at the user's shell
-    emit(out, &encode(fb)?, id, display, Quiet::Fully)
+    emit(out, &encode(fb)?, id, display, cells, Quiet::Fully)
 }
 
 /// How much the terminal reports back about a transmission.
@@ -111,6 +123,7 @@ pub fn emit(
     img: &Encoded,
     id: u32,
     display: bool,
+    cells: Option<(u32, u32)>,
     quiet: Quiet,
 ) -> io::Result<()> {
     let q = quiet.code();
@@ -121,7 +134,15 @@ pub fn emit(
     // by its rows, and the spec leaves the result undefined once
     // that runs past the edge of the screen. the caller places the
     // cursor instead, which it can do deterministically
-    let action = if display { "T,C=1" } else { "t" };
+    let action = match (display, cells) {
+        (false, _) => "t".to_string(),
+        (true, None) => "T,C=1".to_string(),
+
+        // both given, the terminal letterboxes rather than
+        // stretching, so rounding up to whole cells cannot
+        // distort the picture
+        (true, Some((c, r))) => format!("T,C=1,c={c},r={r}"),
+    };
 
     let mut chunks = payload.chunks(RAW_CHUNK).peekable();
     let mut first = true;
@@ -265,7 +286,7 @@ mod tests {
             image::Rgba([x as u8, y as u8, (x * y) as u8, 255])
         });
         let mut out = Vec::new();
-        write(&mut out, &fb, 7).unwrap();
+        write(&mut out, &fb, 7, None).unwrap();
         assert_eq!(payload_of(&out), *fb.as_raw());
     }
 
@@ -308,7 +329,7 @@ mod tests {
     fn header_declares_the_image_size_and_id() {
         let fb = Framebuffer::new(3, 5);
         let mut out = Vec::new();
-        write(&mut out, &fb, 42).unwrap();
+        write(&mut out, &fb, 42, None).unwrap();
         let text = String::from_utf8_lossy(&out);
         assert!(
             text.starts_with("\x1b_Ga=T,C=1,i=42,q=2,f=32,o=z,s=3,v=5,m=0;"),
@@ -318,12 +339,21 @@ mod tests {
     }
 
     #[test]
+    fn a_cell_box_rides_on_the_display_header() {
+        let fb = Framebuffer::new(3, 5);
+        let mut out = Vec::new();
+        write(&mut out, &fb, 42, Some((6, 2))).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("\x1b_Ga=T,C=1,c=6,r=2,i=42,"), "{text:?}");
+    }
+
+    #[test]
     fn every_chunk_but_the_last_is_flagged_and_full() {
         let fb = Framebuffer::from_fn(200, 200, |x, y| {
             image::Rgba([(x ^ y) as u8, (x * 7) as u8, (y * 13) as u8, 255])
         });
         let mut out = Vec::new();
-        write(&mut out, &fb, 1).unwrap();
+        write(&mut out, &fb, 1, None).unwrap();
         let text = String::from_utf8_lossy(&out);
         let flags: Vec<&str> = text.match_indices("m=").map(|(i, _)| &text[i + 2..i + 3]).collect();
         assert!(flags.len() > 1, "test image did not chunk");

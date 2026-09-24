@@ -24,6 +24,10 @@ pub struct Hints {
     // cell is what makes the body text come out the size of the
     // text around it
     pub cell: crate::geometry::CellSize,
+
+    /// The most pixels a side of the result may have: both sides of a
+    /// picture, only the width of a document.
+    pub cap: u32,
 }
 
 /// A decoded source.
@@ -36,6 +40,10 @@ pub struct Loaded {
     // found by looking at it again. this is the same text
     // layout already positioned, kept instead of discarded
     pub index: Option<Index>,
+
+    /// How many pixels of the size asked for one pixel of `fb` covers: more
+    /// than 1 where the cap shrank it.
+    pub per: f64,
 }
 
 #[derive(Debug, Default)]
@@ -162,6 +170,9 @@ fn columns(s: &str) -> usize {
 // cutting the document off at the fold
 pub struct Pieces {
     inner: Inner,
+
+    /// How many pixels of the size asked for one pixel of a piece covers.
+    pub per: f64,
 }
 
 enum Inner {
@@ -186,12 +197,16 @@ impl Iterator for Pieces {
 pub fn pieces(bytes: &[u8], path: &Path, hints: Hints) -> Result<Pieces, Error> {
     #[cfg(feature = "markdown")]
     if matches!(sniff(bytes, path), Format::Markdown) {
+        let chunks = markdown::chunks(bytes, hints)?;
         return Ok(Pieces {
-            inner: Inner::Flowed(markdown::chunks(bytes, hints)?),
+            per: chunks.per(),
+            inner: Inner::Flowed(chunks),
         });
     }
+    let loaded = load(bytes, path, hints)?;
     Ok(Pieces {
-        inner: Inner::Whole(Some(load(bytes, path, hints)?.fb)),
+        inner: Inner::Whole(Some(loaded.fb)),
+        per: loaded.per,
     })
 }
 
@@ -240,12 +255,12 @@ pub fn load(bytes: &[u8], path: &Path, #[cfg_attr(not(any(feature = "svg", featu
             .map_err(|e| Error::Decode(e.to_string())),
 
         #[cfg(feature = "svg")]
-        Format::Svg => svg::load(bytes, hints).map(whole),
+        Format::Svg => svg::load(bytes, capped(hints)).map(|fb| vector(fb, hints)),
         #[cfg(not(feature = "svg"))]
         Format::Svg => Err(Error::Unsupported("SVG (rebuild with --features svg)")),
 
         #[cfg(any(feature = "pdf", feature = "pdf-pdfium"))]
-        Format::Pdf => pdf::load(bytes, hints).map(whole),
+        Format::Pdf => pdf::load(bytes, capped(hints)).map(|fb| vector(fb, hints)),
         #[cfg(not(any(feature = "pdf", feature = "pdf-pdfium")))]
         Format::Pdf => Err(Error::Unsupported("PDF (rebuild with --features pdf)")),
 
@@ -306,7 +321,42 @@ const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd"];
 
 /// A `Loaded` for a source that was decoded in full.
 fn whole(fb: Framebuffer) -> Loaded {
-    Loaded { fb, index: None }
+    Loaded {
+        fb,
+        index: None,
+        per: 1.0,
+    }
+}
+
+/// The box a vector source is drawn into, held to the cap.
+//
+// a contain-fit into a box and then under the cap is the same
+// as a contain-fit into the box clipped to the cap, which lets
+// the decoder rasterize at the final size rather than
+// downsampling afterwards
+#[cfg_attr(not(any(feature = "svg", feature = "pdf", feature = "pdf-pdfium")), allow(dead_code))]
+fn capped(hints: Hints) -> Hints {
+    Hints {
+        max_w: hints.max_w.min(hints.cap),
+        max_h: hints.max_h.min(hints.cap),
+        ..hints
+    }
+}
+
+/// Wrap a vector source drawn into `capped(hints)`.
+#[cfg_attr(not(any(feature = "svg", feature = "pdf", feature = "pdf-pdfium")), allow(dead_code))]
+fn vector(fb: Framebuffer, hints: Hints) -> Loaded {
+    // uncapped, the drawing fills the box along one axis, so
+    // the ratio along that axis is what the cap took off. the
+    // other axis has room to spare and gives a larger ratio
+    let per = (f64::from(hints.max_w) / f64::from(fb.width().max(1)))
+        .min(f64::from(hints.max_h) / f64::from(fb.height().max(1)))
+        .max(1.0);
+    Loaded {
+        fb,
+        index: None,
+        per,
+    }
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

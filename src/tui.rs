@@ -4,10 +4,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::framebuffer::{self, Framebuffer};
-use crate::geometry::CellSize;
+use crate::geometry::{self, CellSize};
 use crate::render::kitty::{self, Placement};
 use crate::source;
-use crate::term::{self, RawTty, Terminal};
+use crate::term::{self, RawTty};
 
 /// How long to block on input before looking for a terminal resize.
 //
@@ -65,15 +65,18 @@ const MARK_DIM: (u8, u8, u8) = (0x8f, 0x3f, 0x6f);
 const ZOOM_IN: f64 = 1.25;
 const ZOOM_OUT: f64 = 0.8;
 
+/// Run the viewer over `files`, sending no image more than `cap` pixels a
+/// side.
 pub fn run(
     files: &[PathBuf],
-    terminal: Terminal,
+    cell: CellSize,
+    cap: u32,
     background: [u8; 3],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut tty = RawTty::open().ok_or("cannot open /dev/tty")?;
     let _screen = Screen::enter()?;
     let mut out = BufWriter::new(std::io::stdout());
-    event_loop(&mut out, &mut tty, files, terminal, background)
+    event_loop(&mut out, &mut tty, files, cell, cap, background)
 }
 
 /// The alternate screen buffer, left on drop.
@@ -129,6 +132,13 @@ struct Shown {
 
     kind: source::Kind,
 
+    /// The size of a terminal cell in this image's pixels.
+    //
+    // the terminal's own cell unless the cap shrank the image,
+    // and then fractional, since the terminal scales it back
+    // up by exactly the factor the cap took off
+    cell: CellSize,
+
     /// Where the words are, for a document; `None` for a picture.
     index: Option<source::Index>,
 }
@@ -145,7 +155,7 @@ struct View {
 }
 
 impl View {
-    fn reset(shown: &Shown, cells: (u32, u32), cell: CellSize) -> View {
+    fn reset(shown: &Shown, cells: (u32, u32)) -> View {
         let mut view = View {
             zoom: 1.0,
             cx: f64::from(shown.w) / 2.0,
@@ -154,7 +164,7 @@ impl View {
 
         // centred, a long document would open in its middle
         if shown.kind == source::Kind::Document {
-            view.cy = geom(shown, &view, cells, cell).src_h / 2.0;
+            view.cy = geom(shown, &view, cells).src_h / 2.0;
         }
         view
     }
@@ -208,10 +218,10 @@ fn event_loop(
     out: &mut impl Write,
     tty: &mut RawTty,
     files: &[PathBuf],
-    terminal: Terminal,
+    cell: CellSize,
+    cap: u32,
     background: [u8; 3],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cell = terminal.cell;
     let continuation = if term::over_ssh() {
         CONTINUATION_SSH
     } else {
@@ -255,7 +265,7 @@ fn event_loop(
 
             // replacing the job drops the receiver, so a
             // superseded worker's result is discarded
-            loading = Some(spawn_load(files[index].clone(), cells, cell, background));
+            loading = Some(spawn_load(files[index].clone(), cells, cell, cap, background));
         }
 
         if let Some(job) = &loading {
@@ -264,7 +274,7 @@ fn event_loop(
                     loading = None;
                     match result {
                         Ok(mut fresh) => {
-                            view = View::reset(&fresh, cells, cell);
+                            view = View::reset(&fresh, cells);
                             for band in &mut fresh.bands {
                                 let Some(payload) = band.payload.take() else {
                                     continue;
@@ -274,6 +284,7 @@ fn event_loop(
                                     &payload,
                                     band.id,
                                     false,
+                                    None,
                                     kitty::Quiet::ErrorsOnly,
                                 )?;
                             }
@@ -284,7 +295,7 @@ fn event_loop(
                             hits.clear();
                             note = None;
                             draw(
-                                out, &shown, &view, cells, cell, files, index, &failure, None,
+                                out, &shown, &view, cells, files, index, &failure, None,
                                 &hits, hit,
                             )?;
                             if let Some(old) = previous {
@@ -321,7 +332,6 @@ fn event_loop(
                 &shown,
                 &view,
                 cells,
-                cell,
                 files,
                 index,
                 &failure,
@@ -352,7 +362,7 @@ fn event_loop(
                 // the window is a different number of rows, so
                 // the top of the view has moved off the grid
                 if let Some(s) = &shown {
-                    snap(&mut view, s, cells, cell);
+                    snap(&mut view, s, cells);
                 }
                 dirty = true;
             }
@@ -389,10 +399,10 @@ fn event_loop(
                     // from where the reader is, not from the top
                     // of the document, which is what / does
                     hit = match &shown {
-                        Some(s) => first_hit(s, &view, &hits, seek, cells, cell),
+                        Some(s) => first_hit(s, &view, &hits, seek, cells),
                         None => 0,
                     };
-                    note = Some(step(&mut view, &shown, &hits, hit, &query, cells, cell));
+                    note = Some(step(&mut view, &shown, &hits, hit, &query, cells));
                 }
             }
             dirty = true;
@@ -412,8 +422,8 @@ fn event_loop(
                 Key::Next | Key::Prev => {}
                 Key::Reset => {
                     if let Some(s) = &shown {
-                        view = View::reset(s, cells, cell);
-                        snap(&mut view, s, cells, cell);
+                        view = View::reset(s, cells);
+                        snap(&mut view, s, cells);
                     }
                     note = None;
                     dirty = true;
@@ -434,12 +444,12 @@ fn event_loop(
                 }
                 Key::Top | Key::Bottom => {
                     if let Some(s) = &shown {
-                        let g = geom(s, &view, cells, cell);
+                        let g = geom(s, &view, cells);
                         view.cy = match key {
                             Key::Top => g.src_h / 2.0,
                             _ => (g.doc_h - g.src_h / 2.0).max(g.src_h / 2.0),
                         };
-                        snap(&mut view, s, cells, cell);
+                        snap(&mut view, s, cells);
                     }
                     note = None;
                     dirty = true;
@@ -449,16 +459,16 @@ fn event_loop(
                         let n = hits.len();
                         hit = (hit + if dir > 0 { 1 } else { n - 1 }) % n;
                     }
-                    note = Some(step(&mut view, &shown, &hits, hit, &query, cells, cell));
+                    note = Some(step(&mut view, &shown, &hits, hit, &query, cells));
                     dirty = true;
                 }
                 Key::Heading(dir) => {
-                    note = Some(heading(&mut view, &shown, dir, cells, cell));
+                    note = Some(heading(&mut view, &shown, dir, cells));
                     dirty = true;
                 }
                 Key::Pan(dx, dy) => {
                     if let Some(s) = &shown {
-                        let g = geom(s, &view, cells, cell);
+                        let g = geom(s, &view, cells);
                         view.cx += dx * g.src_w;
 
                         // a page scrolls by whole rows, so its lines
@@ -477,7 +487,7 @@ fn event_loop(
                         // next band instead of stopping at a seam
                         view.cy = (view.cy + step)
                             .clamp(g.src_h / 2.0, (g.doc_h - g.src_h / 2.0).max(g.src_h / 2.0));
-                        snap(&mut view, s, cells, cell);
+                        snap(&mut view, s, cells);
                     }
                     dirty = true;
                 }
@@ -532,7 +542,6 @@ fn mark(
     s: &Shown,
     view: &View,
     cells: (u32, u32),
-    cell: CellSize,
     hits: &[source::Hit],
     at: usize,
 ) -> std::io::Result<()> {
@@ -540,7 +549,7 @@ fn mark(
     if hits.is_empty() {
         return Ok(());
     }
-    let p = placement(s, view, cells, cell);
+    let p = placement(s, view, cells);
 
     for (n, hit) in hits.iter().enumerate() {
         let Some(line) = ix.lines.get(hit.line) else {
@@ -555,8 +564,8 @@ fn mark(
         // heading sits on the bottom of a box two rows deep,
         // and underlining the top one strikes it through
         let last = f64::from(line.y) + f64::from(line.h) - f64::from(ix.row);
-        let row = (last - f64::from(p.src_y)) / f64::from(cell.h);
-        let col = (px - f64::from(p.src_x)) / f64::from(cell.w);
+        let row = (last - f64::from(p.src_y)) / s.cell.h;
+        let col = (px - f64::from(p.src_x)) / s.cell.w;
         if row < 0.0 || col < 0.0 {
             continue;
         }
@@ -567,7 +576,7 @@ fn mark(
 
         // a heading's columns are wider than the terminal's,
         // so the run is measured in pixels and back again
-        let wide = (hit.cols as f64 * f64::from(line.advance) / f64::from(cell.w)).round();
+        let wide = (hit.cols as f64 * f64::from(line.advance) / s.cell.w).round();
         let width = (wide.max(1.0) as u32).min(p.cols - col);
 
         let (r, g, b) = if n == at { MARK } else { MARK_DIM };
@@ -598,13 +607,12 @@ fn first_hit(
     hits: &[source::Hit],
     dir: i32,
     cells: (u32, u32),
-    cell: CellSize,
 ) -> usize {
     let Some(ix) = &s.index else { return 0 };
     if hits.is_empty() {
         return 0;
     }
-    let top = geom(s, view, cells, cell).doc_top;
+    let top = geom(s, view, cells).doc_top;
     let y = |h: &source::Hit| f64::from(ix.lines[h.line].y);
 
     if dir > 0 {
@@ -624,7 +632,6 @@ fn step(
     at: usize,
     query: &str,
     cells: (u32, u32),
-    cell: CellSize,
 ) -> String {
     let Some(s) = shown else {
         return format!("/{query}  nothing loaded");
@@ -636,7 +643,7 @@ fn step(
         return format!("/{query}  no matches");
     }
     let line = &ix.lines[hits[at].line];
-    scroll_to(view, s, line.y, cells, cell);
+    scroll_to(view, s, line.y, cells);
     format!("/{query}  {}/{}  {}", at + 1, hits.len(), line.text.trim())
 }
 
@@ -646,7 +653,6 @@ fn heading(
     shown: &Option<Shown>,
     dir: i32,
     cells: (u32, u32),
-    cell: CellSize,
 ) -> String {
     let Some(s) = shown else {
         return "nothing loaded".into();
@@ -657,7 +663,7 @@ fn heading(
 
     // measured from the top of the viewport rather than its
     // centre, so the heading already on screen is behind you
-    let top = view.cy - geom(s, view, cells, cell).src_h / 2.0;
+    let top = view.cy - geom(s, view, cells).src_h / 2.0;
     let found = if dir > 0 {
         ix.outline.iter().find(|h| f64::from(h.y) > top + 1.0)
     } else {
@@ -665,7 +671,7 @@ fn heading(
     };
     match found {
         Some(h) => {
-            scroll_to(view, s, h.y, cells, cell);
+            scroll_to(view, s, h.y, cells);
             format!("{} {}", "#".repeat(h.level as usize), h.text.trim())
         }
         None => "no more headings".into(),
@@ -673,8 +679,8 @@ fn heading(
 }
 
 /// Scroll so that page row `y` sits near the top of the viewport.
-fn scroll_to(view: &mut View, s: &Shown, y: f32, cells: (u32, u32), cell: CellSize) {
-    let g = geom(s, view, cells, cell);
+fn scroll_to(view: &mut View, s: &Shown, y: f32, cells: (u32, u32)) {
+    let g = geom(s, view, cells);
     let lo = g.src_h / 2.0;
     let hi = (g.doc_h - g.src_h / 2.0).max(lo);
 
@@ -686,7 +692,7 @@ fn scroll_to(view: &mut View, s: &Shown, y: f32, cells: (u32, u32), cell: CellSi
         None => g.src_h / 6.0,
     };
     view.cy = (f64::from(y) + above).clamp(lo, hi);
-    snap(view, s, cells, cell);
+    snap(view, s, cells);
 }
 
 /// The page's row height, for a document laid out on the row grid.
@@ -698,9 +704,9 @@ fn row_of(s: &Shown) -> Option<f64> {
 }
 
 /// Move the view so the top of the window sits on a row boundary.
-fn snap(view: &mut View, s: &Shown, cells: (u32, u32), cell: CellSize) {
+fn snap(view: &mut View, s: &Shown, cells: (u32, u32)) {
     let Some(row) = row_of(s) else { return };
-    let g = geom(s, view, cells, cell);
+    let g = geom(s, view, cells);
 
     let top = (view.cy - g.src_h / 2.0).max(0.0);
     let snapped = (top / row).round() * row;
@@ -724,21 +730,21 @@ struct Placed {
 }
 
 /// The bands the window can see, top to bottom.
-fn placed(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Vec<Placed> {
+fn placed(s: &Shown, view: &View, cells: (u32, u32)) -> Vec<Placed> {
     // one band is the whole picture, and a picture is fitted
     // rather than drawn 1:1, so it keeps the original sums
     if s.bands.len() == 1 {
         return vec![Placed {
             id: s.bands[0].id,
             row: 0,
-            p: placement(s, view, cells, cell),
+            p: placement(s, view, cells),
         }];
     }
 
     // more than one band means a document, which is drawn 1:1
     // and scrolled in whole rows, so every division here is exact
-    let g = geom(s, view, cells, cell);
-    let whole = placement(s, view, cells, cell);
+    let g = geom(s, view, cells);
+    let whole = placement(s, view, cells);
     let (top, bottom) = (g.doc_top, g.doc_top + g.src_h);
 
     let mut out = Vec::new();
@@ -748,13 +754,13 @@ fn placed(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Vec<Plac
         if to <= from {
             continue;
         }
-        let rows = ((to - from) / f64::from(cell.h)).round() as u32;
+        let rows = ((to - from) / s.cell.h).round() as u32;
         if rows == 0 {
             continue;
         }
         out.push(Placed {
             id: band.id,
-            row: ((from - top) / f64::from(cell.h)).round() as u32,
+            row: ((from - top) / s.cell.h).round() as u32,
             p: Placement {
                 src_y: (from - f64::from(band.y)) as u32,
                 src_h: (to - from) as u32,
@@ -767,8 +773,8 @@ fn placed(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Vec<Plac
 }
 
 /// Decode the source rectangle and destination cell box for the current view.
-fn placement(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Placement {
-    let g = geom(s, view, cells, cell);
+fn placement(s: &Shown, view: &View, cells: (u32, u32)) -> Placement {
+    let g = geom(s, view, cells);
 
     // the terminal does the scaling: the source rectangle is
     // clipped to the image and stretched to fill the cell box,
@@ -785,8 +791,8 @@ fn placement(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Place
             source::Kind::Document => -1,
             source::Kind::Image => 0,
         },
-        cols: ((g.shown_w / cell.w as f64).ceil() as u32).clamp(1, cells.0.max(1)),
-        rows: ((g.shown_h / cell.h as f64).ceil() as u32)
+        cols: ((g.shown_w / s.cell.w).ceil() as u32).clamp(1, cells.0.max(1)),
+        rows: ((g.shown_h / s.cell.h).ceil() as u32)
             .clamp(1, cells.1.saturating_sub(1).max(1)),
     }
 }
@@ -804,12 +810,12 @@ struct Geom {
     doc_top: f64,
 }
 
-fn geom(s: &Shown, view: &View, cells: (u32, u32), cell: CellSize) -> Geom {
+fn geom(s: &Shown, view: &View, cells: (u32, u32)) -> Geom {
     let img_w = f64::from(s.w.max(1));
     let doc_h = f64::from(s.h.max(1));
     let (cols, rows) = (cells.0.max(1), cells.1.saturating_sub(1).max(1));
-    let view_w = (cols * cell.w) as f64;
-    let view_h = (rows * cell.h) as f64;
+    let view_w = f64::from(cols) * s.cell.w;
+    let view_h = f64::from(rows) * s.cell.h;
 
     let base = match s.kind {
         // width alone: fitting the height too would shrink a
@@ -845,7 +851,6 @@ fn draw(
     shown: &Option<Shown>,
     view: &View,
     cells: (u32, u32),
-    cell: CellSize,
     files: &[PathBuf],
     index: usize,
     failure: &Option<String>,
@@ -858,14 +863,14 @@ fn draw(
     out.write_all(b"\x1b[H\x1b[J")?;
 
     if let Some(s) = shown {
-        for band in placed(s, view, cells, cell) {
+        for band in placed(s, view, cells) {
             // each band is placed where the cursor is, and the
             // protocol's C=1 leaves the cursor alone, so the
             // caller says where every one of them goes
             write!(out, "\x1b[{};1H", band.row + 1)?;
             kitty::place(out, band.id, &band.p)?;
         }
-        mark(out, s, view, cells, cell, hits, at)?;
+        mark(out, s, view, cells, hits, at)?;
     }
 
     let name = files[index]
@@ -894,6 +899,7 @@ fn load(
     path: &Path,
     cells: (u32, u32),
     cell: CellSize,
+    cap: u32,
     background: [u8; 3],
 ) -> Result<Shown, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
@@ -906,17 +912,19 @@ fn load(
         source::Kind::Image => ZOOM_HEADROOM,
     };
     let hints = source::Hints {
-        max_w: cells.0 * cell.w * headroom,
+        max_w: (f64::from(cells.0 * headroom) * cell.w) as u32,
         max_h: match kind {
             // the whole document: scrolling places out of this
             // buffer rather than drawing the page again
             source::Kind::Document => u32::MAX,
-            source::Kind::Image => cells.1 * cell.h * headroom,
+            source::Kind::Image => (f64::from(cells.1 * headroom) * cell.h) as u32,
         },
         cell,
+        cap,
     };
     let loaded = source::load(&bytes, path, hints)?;
-    let (decoded, mut index) = (loaded.fb, loaded.index);
+    let (decoded, mut index, drawn) = (loaded.fb, loaded.index, loaded.per);
+    let (dw, dh) = (f64::from(decoded.width()), f64::from(decoded.height()));
 
     // a document is exempt: its height is the document, and a
     // screenful of it would drop the text panning is for
@@ -924,14 +932,22 @@ fn load(
         source::Kind::Document => f64::INFINITY,
         source::Kind::Image => hints.max_h as f64,
     };
-    let scale = (hints.max_w as f64 / decoded.width() as f64)
-        .min(height_limit / decoded.height() as f64)
+    let fit = (hints.max_w as f64 / drawn / dw)
+        .min(height_limit / drawn / dh)
         .min(1.0);
+
+    // a document's height is its length, so only its width
+    // is held to the cap
+    let over = match kind {
+        source::Kind::Document => geometry::over_cap(dw * fit, 0.0, cap),
+        source::Kind::Image => geometry::over_cap(dw * fit, dh * fit, cap),
+    };
+    let scale = fit / over;
     let mut fb = if scale < 1.0 {
         framebuffer::resize(
             &decoded,
-            (decoded.width() as f64 * scale).round().max(1.0) as u32,
-            (decoded.height() as f64 * scale).round().max(1.0) as u32,
+            (dw * scale).round().max(1.0) as u32,
+            (dh * scale).round().max(1.0) as u32,
         )
     } else {
         decoded
@@ -943,12 +959,18 @@ fn load(
     if let Some(ix) = index.as_mut() {
         ix.scale(scale as f32);
     }
+    let per = drawn * over;
+    let cell = CellSize {
+        w: cell.w / per,
+        h: cell.h / per,
+    };
     let (w, h) = (fb.width(), fb.height());
     Ok(Shown {
         w,
         h,
-        bands: split(fb, band_height(w, cell.h))?,
+        bands: split(fb, band_height(w, cell.h.round() as u32))?,
         kind,
+        cell,
         index,
     })
 }
@@ -1003,11 +1025,12 @@ fn spawn_load(
     path: PathBuf,
     cells: (u32, u32),
     cell: CellSize,
+    cap: u32,
     background: [u8; 3],
 ) -> Loading {
     let (tx, done) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = load(&path, cells, cell, background).map_err(|e| e.to_string());
+        let result = load(&path, cells, cell, cap, background).map_err(|e| e.to_string());
 
         // the receiver is gone if the viewer has moved on
         let _ = tx.send(result);
@@ -1180,7 +1203,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
-    const CELL: CellSize = CellSize { w: 10, h: 20 };
+    const CELL: CellSize = CellSize { w: 10.0, h: 20.0 };
 
     fn image(w: u32, h: u32) -> Framebuffer {
         Framebuffer::new(w, h)
@@ -1250,7 +1273,6 @@ mod tests {
             &Some(shown(image(400, 4000), kind)),
             &view(1.0, 200.0, 300.0),
             (100, 24),
-            CELL,
             &files,
             0,
             &None,
@@ -1284,7 +1306,7 @@ mod tests {
 
     /// The top of the window, in page pixels.
     fn top_of(s: &Shown, v: &View) -> f64 {
-        geom(s, v, (80, 25), CELL).doc_top
+        geom(s, v, (80, 25)).doc_top
     }
 
     #[test]
@@ -1340,7 +1362,7 @@ mod tests {
         // 380 of the next
         let s = banded(400, 4000, 1000);
         let view = view(1.0, 200.0, 1140.0);
-        let bands = placed(&s, &view, (80, 25), CELL);
+        let bands = placed(&s, &view, (80, 25));
 
         assert_eq!(bands.len(), 2, "a seam needs both sides of it");
 
@@ -1365,7 +1387,7 @@ mod tests {
     fn a_window_inside_one_band_places_only_that_band() {
         let s = banded(400, 4000, 1000);
         let view = view(1.0, 200.0, 1500.0);
-        let bands = placed(&s, &view, (80, 25), CELL);
+        let bands = placed(&s, &view, (80, 25));
         assert_eq!(bands.len(), 1);
         assert_eq!(bands[0].id, 101, "the second band");
         assert_eq!(bands[0].row, 0);
@@ -1374,8 +1396,8 @@ mod tests {
     #[test]
     fn a_picture_is_still_placed_whole() {
         let s = shown(image(400, 300), source::Kind::Image);
-        let view = View::reset(&s, (80, 25), CELL);
-        let bands = placed(&s, &view, (80, 25), CELL);
+        let view = View::reset(&s, (80, 25));
+        let bands = placed(&s, &view, (80, 25));
         assert_eq!(bands.len(), 1);
         assert_eq!(bands[0].row, 0);
     }
@@ -1383,11 +1405,11 @@ mod tests {
     #[test]
     fn a_document_window_snaps_to_a_row_boundary() {
         let s = document(20.0);
-        let mut v = View::reset(&s, (80, 25), CELL);
+        let mut v = View::reset(&s, (80, 25));
 
         for offset in [1.0, 9.0, 11.0, 19.0, 33.0, 197.0] {
-            v.cy = View::reset(&s, (80, 25), CELL).cy + offset;
-            snap(&mut v, &s, (80, 25), CELL);
+            v.cy = View::reset(&s, (80, 25)).cy + offset;
+            snap(&mut v, &s, (80, 25));
             let top = top_of(&s, &v);
             assert!(
                 (top / 20.0 - (top / 20.0).round()).abs() < 1e-6,
@@ -1400,18 +1422,18 @@ mod tests {
     fn a_picture_is_left_where_it_was() {
         // an image has no rows to snap to
         let s = shown(image(400, 4000), source::Kind::Image);
-        let mut v = View::reset(&s, (80, 25), CELL);
+        let mut v = View::reset(&s, (80, 25));
         let before = v.cy;
-        snap(&mut v, &s, (80, 25), CELL);
+        snap(&mut v, &s, (80, 25));
         assert_eq!(v.cy, before);
     }
 
     #[test]
     fn a_search_jump_lands_on_a_row_boundary() {
         let s = document(20.0);
-        let mut v = View::reset(&s, (80, 25), CELL);
+        let mut v = View::reset(&s, (80, 25));
         for y in [400.0, 1234.0, 2001.0, 3999.0] {
-            scroll_to(&mut v, &s, y, (80, 25), CELL);
+            scroll_to(&mut v, &s, y, (80, 25));
             let top = top_of(&s, &v);
             assert!(
                 (top / 20.0 - (top / 20.0).round()).abs() < 1e-6,
@@ -1421,9 +1443,9 @@ mod tests {
     }
 
     fn marked(s: &Shown, hits: &[source::Hit], at: usize) -> String {
-        let v = View::reset(s, (80, 25), CELL);
+        let v = View::reset(s, (80, 25));
         let mut out = Vec::new();
-        mark(&mut out, s, &v, (80, 25), CELL, hits, at).unwrap();
+        mark(&mut out, s, &v, (80, 25), hits, at).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -1525,12 +1547,12 @@ mod tests {
     #[test]
     fn a_page_is_placed_under_the_text_layer_and_a_picture_is_not() {
         let doc = document(20.0);
-        let v = View::reset(&doc, (80, 25), CELL);
-        assert_eq!(placement(&doc, &v, (80, 25), CELL).z, -1);
+        let v = View::reset(&doc, (80, 25));
+        assert_eq!(placement(&doc, &v, (80, 25)).z, -1);
 
         let pic = shown(image(400, 4000), source::Kind::Image);
-        let v = View::reset(&pic, (80, 25), CELL);
-        assert_eq!(placement(&pic, &v, (80, 25), CELL).z, 0);
+        let v = View::reset(&pic, (80, 25));
+        assert_eq!(placement(&pic, &v, (80, 25)).z, 0);
     }
 
     #[test]
@@ -1619,6 +1641,7 @@ mod tests {
                 payload: None,
             }],
             kind,
+            cell: CELL,
             index: None,
         }
     }
@@ -1638,19 +1661,35 @@ mod tests {
     }
 
     #[test]
+    fn a_capped_picture_covers_the_cells_it_would_have_uncapped() {
+        let full = shown(image(1600, 900), source::Kind::Image);
+        let mut capped = shown(image(800, 450), source::Kind::Image);
+        capped.cell = CellSize {
+            w: CELL.w / 2.0,
+            h: CELL.h / 2.0,
+        };
+        let at = |s: &Shown| {
+            let v = View::reset(s, (80, 25));
+            let p = placement(s, &v, (80, 25));
+            (p.cols, p.rows)
+        };
+        assert_eq!(at(&capped), at(&full));
+    }
+
+    #[test]
     fn a_document_is_fitted_on_width_and_scrolls() {
         // an image is fitted on both axes and has nowhere to
         // pan at rest; a page fitted that way is unreadable
         let page = Framebuffer::new(900, 6000);
         let v = view(1.0, 450.0, 200.0);
 
-        let doc = placement(&shown(page.clone(), source::Kind::Document), &v, (100, 30), CELL);
+        let doc = placement(&shown(page.clone(), source::Kind::Document), &v, (100, 30));
         assert!(
             doc.src_h < 6000,
             "a document showed its whole height at rest, so there is no scroll"
         );
 
-        let pic = placement(&shown(page.clone(), source::Kind::Image), &v, (100, 30), CELL);
+        let pic = placement(&shown(page.clone(), source::Kind::Image), &v, (100, 30));
         assert_eq!(pic.src_h, 6000, "a picture should still be fitted whole");
         assert!(
             doc.src_h < pic.src_h,
@@ -1662,15 +1701,15 @@ mod tests {
     fn a_document_opens_at_its_first_line() {
         let page = Framebuffer::new(900, 6000);
         let s = shown(page, source::Kind::Document);
-        let v = View::reset(&s, (100, 30), CELL);
-        let p = placement(&s, &v, (100, 30), CELL);
+        let v = View::reset(&s, (100, 30));
+        let p = placement(&s, &v, (100, 30));
         assert_eq!(p.src_y, 0, "document did not open at the top");
     }
 
     #[test]
     fn unzoomed_shows_the_whole_image() {
         let img = image(1000, 500);
-        let p = placement(&shown(img.clone(), source::Kind::Image), &view(1.0, 500.0, 250.0), (80, 25), CELL);
+        let p = placement(&shown(img.clone(), source::Kind::Image), &view(1.0, 500.0, 250.0), (80, 25));
         assert_eq!((p.src_x, p.src_y), (0, 0));
         assert_eq!((p.src_w, p.src_h), (1000, 500));
     }
@@ -1678,8 +1717,8 @@ mod tests {
     #[test]
     fn zooming_in_shrinks_the_source_rectangle() {
         let img = image(1000, 500);
-        let wide = placement(&shown(img.clone(), source::Kind::Image), &view(1.0, 500.0, 250.0), (80, 25), CELL);
-        let close = placement(&shown(img.clone(), source::Kind::Image), &view(2.0, 500.0, 250.0), (80, 25), CELL);
+        let wide = placement(&shown(img.clone(), source::Kind::Image), &view(1.0, 500.0, 250.0), (80, 25));
+        let close = placement(&shown(img.clone(), source::Kind::Image), &view(2.0, 500.0, 250.0), (80, 25));
         assert!(close.src_w < wide.src_w && close.src_h < wide.src_h);
         // the axis that was already filling the viewport
         // halves exactly; the letterboxed axis shows less
@@ -1692,9 +1731,9 @@ mod tests {
     fn the_source_rectangle_keeps_the_display_box_aspect_ratio() {
         let img = image(1000, 500);
         for zoom in [1.0, 1.5, 2.0, 8.0] {
-            let p = placement(&shown(img.clone(), source::Kind::Image), &view(zoom, 500.0, 250.0), (80, 25), CELL);
+            let p = placement(&shown(img.clone(), source::Kind::Image), &view(zoom, 500.0, 250.0), (80, 25));
             let src = p.src_w as f64 / p.src_h as f64;
-            let dst = (p.cols * CELL.w) as f64 / (p.rows * CELL.h) as f64;
+            let dst = (f64::from(p.cols) * CELL.w) / (f64::from(p.rows) * CELL.h);
             assert!(
                 (src - dst).abs() < 0.12,
                 "zoom {zoom}: source {src:.3} vs box {dst:.3}"
@@ -1706,7 +1745,7 @@ mod tests {
     fn the_cell_box_never_exceeds_the_viewport() {
         let img = image(4000, 3000);
         for zoom in [1.0, 2.0, 8.0, 32.0] {
-            let p = placement(&shown(img.clone(), source::Kind::Image), &view(zoom, 2000.0, 1500.0), (80, 25), CELL);
+            let p = placement(&shown(img.clone(), source::Kind::Image), &view(zoom, 2000.0, 1500.0), (80, 25));
             assert!(p.cols <= 80, "cols {} at zoom {zoom}", p.cols);
             // one row is held back for the status line
             assert!(p.rows <= 24, "rows {} at zoom {zoom}", p.rows);
@@ -1716,10 +1755,10 @@ mod tests {
     #[test]
     fn panning_past_an_edge_clamps_inside_the_image() {
         let img = image(1000, 500);
-        let p = placement(&shown(img.clone(), source::Kind::Image), &view(4.0, -9000.0, -9000.0), (80, 25), CELL);
+        let p = placement(&shown(img.clone(), source::Kind::Image), &view(4.0, -9000.0, -9000.0), (80, 25));
         assert_eq!((p.src_x, p.src_y), (0, 0));
 
-        let q = placement(&shown(img.clone(), source::Kind::Image), &view(4.0, 9000.0, 9000.0), (80, 25), CELL);
+        let q = placement(&shown(img.clone(), source::Kind::Image), &view(4.0, 9000.0, 9000.0), (80, 25));
         assert_eq!(q.src_x + q.src_w, 1000);
         assert_eq!(q.src_y + q.src_h, 500);
     }
@@ -1727,7 +1766,7 @@ mod tests {
     #[test]
     fn a_small_image_is_not_enlarged_at_rest() {
         let img = image(40, 30);
-        let p = placement(&shown(img.clone(), source::Kind::Image), &view(1.0, 20.0, 15.0), (80, 25), CELL);
+        let p = placement(&shown(img.clone(), source::Kind::Image), &view(1.0, 20.0, 15.0), (80, 25));
         assert_eq!((p.src_w, p.src_h), (40, 30));
         assert_eq!((p.cols, p.rows), (4, 2));
     }
@@ -1808,13 +1847,13 @@ mod tests {
             })
             .collect();
 
-        let mut v = View::reset(&s, (80, 25), CELL);
-        scroll_to(&mut v, &s, 700.0, (80, 25), CELL);
+        let mut v = View::reset(&s, (80, 25));
+        scroll_to(&mut v, &s, 700.0, (80, 25));
 
         // the window top is at y=540, so forwards is the
         // match on line 40 and backwards the one on line 4
-        assert_eq!(first_hit(&s, &v, &hits, 1, (80, 25), CELL), 1);
-        assert_eq!(first_hit(&s, &v, &hits, -1, (80, 25), CELL), 0);
+        assert_eq!(first_hit(&s, &v, &hits, 1, (80, 25)), 1);
+        assert_eq!(first_hit(&s, &v, &hits, -1, (80, 25)), 0);
     }
 
     #[test]

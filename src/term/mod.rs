@@ -178,8 +178,8 @@ fn window_size() -> (u32, u32, Option<CellSize>) {
     //
     // TODO: the 2px and 4px floors have no recorded source
     let cell = (xp >= 2 * cols && yp >= 4 * rows).then(|| CellSize {
-        w: xp / cols,
-        h: yp / rows,
+        w: f64::from(xp / cols),
+        h: f64::from(yp / rows),
     });
     (cols, rows, cell)
 }
@@ -196,7 +196,7 @@ fn query_cell_size(probe: &mut query::Probe, budget: Duration) -> Option<CellSiz
     let mut parts = std::str::from_utf8(&tail[..end]).ok()?.split(';');
     let h: u32 = parts.next()?.trim().parse().ok()?;
     let w: u32 = parts.next()?.trim().parse().ok()?;
-    (w > 0 && h > 0).then_some(CellSize { w, h })
+    (w > 0 && h > 0).then_some(CellSize { w: f64::from(w), h: f64::from(h) })
 }
 
 /// Identify the protocol from the environment alone, without writing

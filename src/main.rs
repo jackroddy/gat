@@ -22,7 +22,12 @@ struct Args {
     force: bool,
     print: bool,
     keep: bool,
+    cap: u32,
 }
+
+/// The most pixels a side of an image sent to the terminal may have, unless
+/// `--cap` says otherwise.
+const CAP: u32 = 1024;
 
 /// Where the one-shot renderer's image ids come from.
 enum Ids {
@@ -82,7 +87,7 @@ fn main() -> ExitCode {
     // both, a piped or redirected run still gets the one-shot rendering
     let interactive = !args.print && rustix::termios::isatty(rustix::stdio::stdout());
     if interactive {
-        if let Err(e) = tui::run(&args.files, terminal, args.background) {
+        if let Err(e) = tui::run(&args.files, terminal.cell, args.cap, args.background) {
             eprintln!("gat: {e}");
             return ExitCode::FAILURE;
         }
@@ -107,7 +112,7 @@ fn main() -> ExitCode {
     };
 
     for path in &args.files {
-        if let Err(e) = show(&mut out, path, &budget, args.background, &mut ids) {
+        if let Err(e) = show(&mut out, path, &budget, args.cap, args.background, &mut ids) {
             let _ = out.flush();
             eprintln!("gat: {}: {e}", path.display());
             failed = true;
@@ -124,40 +129,70 @@ fn show(
     out: &mut impl Write,
     path: &std::path::Path,
     budget: &Budget,
+    cap: u32,
     background: [u8; 3],
     ids: &mut Ids,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
     let flowed = source::kind(&bytes, path) == source::Kind::Document;
     let hints = source::Hints {
-        max_w: budget.cols * budget.cell.w,
+        max_w: (f64::from(budget.cols) * budget.cell.w) as u32,
         // a document is written into the scrollback in pieces, so
         // it is not cut off at the fold the way a page with an
         // edge of its own would be
         max_h: if flowed {
             u32::MAX
         } else {
-            budget.rows * budget.cell.h
+            (f64::from(budget.rows) * budget.cell.h) as u32
         },
         cell: budget.cell,
+        cap,
     };
 
-    for piece in source::pieces(&bytes, path, hints)? {
+    let pieces = source::pieces(&bytes, path, hints)?;
+    let drawn = pieces.per;
+    for piece in pieces {
         let decoded = piece?;
+        let (dw, dh) = (f64::from(decoded.width()), f64::from(decoded.height()));
 
         // a picture is fitted to the screen; a document was laid
         // out at the terminal's own text size and fitting it
         // would undo that
-        let mut fb = if flowed {
-            decoded
+        let (mut fb, per) = if flowed {
+            (decoded, drawn)
         } else {
-            let (w, h) = geometry::fit(decoded.width(), decoded.height(), budget);
-            framebuffer::resize(&decoded, w, h)
+            let (w, h) = geometry::fit(
+                (dw * drawn).round() as u32,
+                (dh * drawn).round() as u32,
+                budget,
+            );
+            let over = geometry::over_cap(f64::from(w), f64::from(h), cap);
+            let (fw, fh) = (
+                (f64::from(w) / over).round().max(1.0),
+                (f64::from(h) / over).round().max(1.0),
+            );
+
+            // a vector source is already drawn under the cap, and
+            // a pixel's disagreement in rounding is not worth a
+            // resample
+            let fb = if (fw - dw).abs() <= 1.0 && (fh - dh).abs() <= 1.0 {
+                decoded
+            } else {
+                framebuffer::resize(&decoded, fw as u32, fh as u32)
+            };
+            (fb, over)
         };
         framebuffer::flatten_onto(&mut fb, background);
 
-        let rows = fb.height().div_ceil(budget.cell.h);
-        render::kitty::write(out, &fb, ids.next())?;
+        // the tolerance absorbs a document's rows, which are
+        // whole cells but reach here through a float division
+        let span = |px: u32, cell: f64| (f64::from(px) * per / cell - 1e-6).ceil().max(1.0) as u32;
+        let rows = span(fb.height(), budget.cell.h);
+
+        // a capped image covers the cells it would have covered
+        // uncapped, and the terminal scales it up into them
+        let cells = (per > 1.0).then(|| (span(fb.width(), budget.cell.w), rows));
+        render::kitty::write(out, &fb, ids.next(), cells)?;
 
         // the renderer sets C=1, so the cursor is still at the
         // image's top left corner and the next output would
@@ -183,6 +218,7 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
         force: false,
         print: false,
         keep: false,
+        cap: CAP,
     };
 
     let mut parser = lexopt::Parser::from_env();
@@ -203,13 +239,25 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Long("fit-height") => args.fill_height = true,
             Long("force-kitty") => args.force = true,
             Short('p') | Long("print") => args.print = true,
+            Long("cap") => {
+                args.cap = parser
+                    .value()?
+                    .string()?
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| lexopt::Error::from("cap wants a pixel count above 0"))?;
+            }
             Long("keep") => args.keep = true,
             Long("probe") => {
                 print!("terminal probe:\n{}", term::explain());
                 let t = term::Terminal::detect();
                 print!(
                     "\nhow tall an image this terminal will take:\n{}",
-                    term::height_ladder(t.cols * t.cell.w, t.rows.saturating_sub(1) * t.cell.h)
+                    term::height_ladder(
+                        (f64::from(t.cols) * t.cell.w) as u32,
+                        (f64::from(t.rows.saturating_sub(1)) * t.cell.h) as u32,
+                    )
                 );
                 return Ok(None);
             }
@@ -258,6 +306,8 @@ usage: gat [options] <file>...
       --fit-height     use the full height, letting width overflow
   -b, --background C   composite transparency over color C (#rrggbb)
   -p, --print          write the image to stdout and exit, no viewer
+      --cap N          send no image wider or taller than N pixels (1024);
+                       a document is capped on width only
       --keep           leave images from earlier runs in the terminal
       --force-kitty    emit kitty sequences even if detection says no
       --probe          report what terminal detection sees, then exit
